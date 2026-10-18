@@ -624,7 +624,7 @@ IMAGE_MODELS = {
     "gpt-4o-image": "GPT-4o 图像生成",
     "gemini-3-pro-image-preview": "Gemini 3 Pro Image",
     "gemini-3.1-flash": "Gemini 3.1 Flash Image",
-    "gemini-2.5-flash": "Gemini 2.5 Flash Image（Nano Banana）",
+    "gemini-2.5-flash-image-preview": "Gemini 2.5 Flash Image（Nano Banana）",
     "qwen-image-3.0": "Qwen Image 3.0",
     "seedream-4.5": "Seedream 4.5",
     "seedream-5.0": "Seedream 5.0 lite",
