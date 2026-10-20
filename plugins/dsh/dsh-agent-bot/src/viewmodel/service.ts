@@ -1,0 +1,567 @@
+/**
+ * provide('agentBot') 门面。
+ * G1–G7：list / get / provider / 校验 / sessionKey / 队列。
+ * G8：队列内 planSession + ensureAgent。
+ * G9：followup 超时从实际开始起算。
+ * G10：idle 收口成单条 markdown。
+ * G11：超时未 idle 时 pending 二次竞速，安全阀到点 reject。
+ * G12：本轮收口写 lastAskAt 并落盘。
+ * G13：unload 时 dispose 全部 live handle。
+ */
+import { randomUUID } from 'node:crypto'
+import { planSession, prepareAsk, settleAskRound, startFollowupTurn, summarizeOwnedInterval, toMarkdownMessages } from '../model/ask.js'
+import type { FollowupAgent as FollowupAgentLike } from '../model/ask.js'
+import { getAgent as getAgentConfig, listAgents as listAgentConfigs, touchSession } from '../model/agents.js'
+import { loadConfig } from '../model/config.js'
+import { directAskPlacement } from '../model/direct-ask.js'
+import { appendLog } from './rpc.js'
+import { assemblePromptText, appendPromptToUserContext, getPrompt, promptFingerprintFor, promptVariableNames, skillToolNamesForAgent } from '../model/prompts.js'
+import { createAskQueue, enqueueHoldPending } from '../model/queue.js'
+import { createAgentRuntime, type HostServices } from '../model/runtime.js'
+import type { AgentConfig } from '../model/config.js'
+import { registerBoardTools } from '../model/teamwork/board-tools.js'
+import { createPatrol } from '../model/teamwork/patrol.js'
+import { describeTasks, listTasksIn, filterByConversation, moveTask, readTask as readTaskModel, writeTask as writeTaskModel, type GroupMember } from '../model/teamwork/task-board.js'
+import { boundTaskId, unbindSession } from '../model/teamwork/binding.js'
+import { ensureHandoffJob, isCrossSessionHandoff, isHandoffTask } from '../model/teamwork/handoff-task.js'
+import { taskSlotKey } from '../model/teamwork/relay.js'
+import { rememberInbound } from '../model/teamwork/inbound.js'
+import { conversationKeyOf } from '../types.js'
+import type {
+  AgentAskRequest,
+  AgentAskResponse,
+  AgentBotService,
+  AgentChannelProviderInfo,
+  AgentChannelProviderRegistration,
+  AgentDeliverRequest,
+  AgentOutboundMessage,
+  AgentSummary,
+} from '../types.js'
+
+function toSummary(agent: { id: string; name: string; slug?: string; description: string; workspace: string }): AgentSummary {
+  return {
+    id: agent.id,
+    name: agent.name,
+    slug: agent.slug,
+    description: agent.description,
+    workspace: agent.workspace,
+  }
+}
+
+/** 空宿主：未注入 DSH 服务时 ensureAgent 显式抛「agents 服务不可用」。 */
+export function emptyHostServices(): HostServices {
+  return {
+    agents: () => undefined,
+    agentDefaultModel: () => undefined,
+    agentPresets: () => undefined,
+    sessionPersistence: () => undefined,
+    sessions: () => undefined,
+    workspaceRegistry: () => undefined,
+    toolsMount: () => undefined,
+  }
+}
+
+/** 从 Cordis ctx duck-type 取出宿主服务。 */
+export function hostServicesFromContext(ctx: { get(name: string): unknown }): HostServices {
+  return {
+    agents: () => ctx.get('agents') as ReturnType<HostServices['agents']>,
+    agentDefaultModel: () => ctx.get('agentDefaultModel') as ReturnType<HostServices['agentDefaultModel']>,
+    agentPresets: () => ctx.get('agentPresets') as ReturnType<HostServices['agentPresets']>,
+    sessionPersistence: () => ctx.get('sessionPersistence') as ReturnType<HostServices['sessionPersistence']>,
+    sessions: () => ctx.get('sessions') as ReturnType<HostServices['sessions']>,
+    workspaceRegistry: () => ctx.get('workspaceRegistry') as ReturnType<HostServices['workspaceRegistry']>,
+    toolsMount: () => undefined,
+  }
+}
+
+function promptTextFor(
+  agentId: string,
+  promptName: string,
+  skillGroupIds: readonly string[],
+  appendSkills: boolean,
+): string {
+  if (promptName.trim() === '') return ''
+  const preset = getPrompt(promptName)
+  if (preset === undefined) throw new Error(`agent-bot: agent ${agentId} 引用了未知预设 ${promptName}`)
+  const tools = appendSkills ? skillToolNamesForAgent(skillGroupIds) : []
+  return assemblePromptText(preset, tools)
+}
+
+function variableValues(req: AgentAskRequest, sessionKey: string): Record<string, string> {
+  promptVariableNames(req.meta.sessionParts)
+  const values: Record<string, string> = {
+    sender: req.meta.sender,
+    session_key: sessionKey,
+    provider_id: req.meta.providerId,
+  }
+  for (const [key, value] of Object.entries(req.meta.sessionParts)) {
+    values[key] = value
+  }
+  return values
+}
+
+/** 门面 + unload 时 dispose live handle。dispose 不进通道契约。 */
+export type AgentBotHostService = AgentBotService & { dispose(): Promise<void> }
+
+/** 从登记的 provider 查 listGroupAgents / deliver。 */
+export const LOCAL_PROVIDER: AgentChannelProviderInfo = {
+  id: 'local',
+  label: '本地',
+  // 本地没有"群"概念：整台中枢的 local 共用一块板（换网页会话也看得到旧单，不会重复建单）
+  conversationKey: () => 'local',
+}
+
+/** 创建 agentBot 服务。host 由组合根注入；测试可传假服务。 */
+/** 进程内已登记 Provider：公共字段 + 内部代令牌。 */
+interface StoredProvider extends AgentChannelProviderInfo {
+  token: symbol
+}
+
+export function createAgentBotService(host: HostServices): AgentBotHostService {
+  /** 交互动兜底入口（ask 结束后调用，定义见下）。 */
+  let service_notifyIdle: (sessionId: string) => void = () => undefined
+  const providers = new Map<string, StoredProvider>()
+  /**
+   * 本地收件箱：网页对话没有推送通道，patrol 的异步消息（问卷 / 进度 / 提醒）
+   * 按「哪次对话」存下来，由 chat 页轮询取走。key = 该轮 sessionParts 的对话标识。
+   */
+  const localInbox = new Map<string, AgentOutboundMessage[]>()
+  /** 单次对话最多滞留多少条（防止没人开页面时无限增长）。 */
+  const LOCAL_INBOX_MAX = 50
+  const localInboxKey = (parts: Record<string, string>): string => parts.session ?? parts.group_id ?? 'local'
+  // 预置内置 local provider：不走 registerProvider（无 disposer、固定）。
+  providers.set(LOCAL_PROVIDER.id, {
+    ...LOCAL_PROVIDER,
+    token: Symbol('agent-bot:builtin-local'),
+    // local 的 deliver：回给**发起这一单的那条 DSH 会话**（`/agent_xxx` 是在那条会话里敲的）。
+    // 会话还活着 → 直接往里推一条消息（和 delegateViaTool 同一条路）；不在线 → 落收件箱兜底。
+    deliver: async (req) => {
+      const key = localInboxKey(req.sessionParts)
+      const text = req.messages.map((m) => m.text).filter((t) => t !== '').join('\n\n')
+      const live = key === 'local' ? undefined : host.agents()?.get(key)
+      if (live !== undefined && text !== '') {
+        const agent = live as unknown as { followup(input: unknown): void }
+        agent.followup({
+          id: `agent-bot-local-${Date.now()}`,
+          role: 'user',
+          content: [{ type: 'text', text: `【agent-bot】${text}\n\n（这是专家回传，请直接呈现给用户，不要再次调用 agent_ask。）` }],
+          source: { kind: 'user' },
+        })
+        return
+      }
+      const list = localInbox.get(key) ?? []
+      list.push(...req.messages)
+      while (list.length > LOCAL_INBOX_MAX) list.shift()
+      localInbox.set(key, list)
+    },
+  })
+  const queue = createAskQueue()
+
+  /**
+   * 异步模式的收尾：等这一轮结束 → 取本轮产出 → 经通道 `deliver` 推回原会话。
+   * 两种收场：
+   *  - 这一轮**派了活**（绑定的任务上已有 assignee）→ 不推本轮文本（回执已覆盖；
+   *    spec：派发轮的助手长文本丢弃），最终结果由收口那一步 deliver。
+   *  - 没派活（直答）→ 把本轮文本推回去，那就是答案。
+   */
+  async function pushRoundResult(
+    agent: FollowupAgentLike,
+    req: AgentAskRequest,
+    sessionId: string,
+    firstSeq: number,
+    boundBefore?: string,
+    pendingBefore?: number,
+  ): Promise<void> {
+    try {
+      await agent.whenIdle()
+      // 人 @ 了这条会话并说完这一轮 → 旧问卷视为已回填（与同步路径同一套规则）
+      clearAnsweredPending(boundBefore, pendingBefore)
+      service_notifyIdle(sessionId)
+      const bound = boundTaskId(sessionId)
+      const task = bound === undefined ? undefined : readTaskModel('running', bound)
+      if (task !== undefined && task.assignees.length > 0) return // 派了活：交给收口
+      if (task !== undefined && task.pendingHuman !== undefined) return // 问了人：留给巡检
+      const text = summarizeOwnedInterval(agent.session.snapshotEvents(), firstSeq)
+      if (text !== '') {
+        const deliver = providerDeliver(req.meta.providerId)
+        if (deliver === undefined) return
+        await deliver({
+          sessionParts: { provider_id: req.meta.providerId, ...req.meta.sessionParts },
+          messages: toMarkdownMessages(text).map((m) => ({ ...m, atUserIds: req.meta.sender === '' ? [] : [req.meta.sender] })),
+        })
+      }
+      finishSelfDoneHandoff(sessionId)
+    } catch (err) {
+      appendLog('deliver', `异步推回失败: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  /** 跨会话任务自己做完（没派、没问人）→ 移 done/ 并解绑。派了或问了人则不动。 */
+  function finishSelfDoneHandoff(sessionId: string): void {
+    const taskId = boundTaskId(sessionId)
+    if (taskId === undefined) return
+    const task = readTaskModel('running', taskId)
+    if (task === undefined || !isHandoffTask(task, sessionId)) return
+    if (task.assignees.length > 0 || task.pendingHuman !== undefined) return
+    if (boundTaskId(sessionId) === task.taskId) unbindSession(sessionId)
+    if (readTaskModel('running', task.taskId) !== undefined) moveTask('running', 'done', task.taskId)
+  }
+
+  /** 调用方是另一条 DSH 会话（GUI `session-` 或仍活着的 agent），不是配置站 chat key。 */
+  function callerIsAgentSession(caller: string): boolean {
+    if (caller === '' || caller === 'local') return false
+    if (caller.startsWith('session-')) return true
+    return host.agents()?.get(caller) !== undefined
+  }
+
+  /** 这一轮结束后清掉"已回填"的待决：askedAt 未变才清（换了新问题就保留）。 */
+  function clearAnsweredPending(boundBefore?: string, pendingBefore?: number): void {
+    if (boundBefore === undefined || pendingBefore === undefined) return
+    const t = readTaskModel('running', boundBefore)
+    if (t?.pendingHuman === undefined || t.pendingHuman.askedAt !== pendingBefore) return
+    t.pendingHuman = undefined
+    writeTaskModel('running', t)
+  }
+
+  /** 某 provider + sessionParts 的「对话」标识（板可见性用）。 */
+  function conversationKeyFor(providerId: string, parts: Record<string, string>): string {
+    return conversationKeyOf(parts, providers.get(providerId)?.conversationKey)
+  }
+
+  /**
+   * 入站软路由（specs/12 §会话分层与入站路由）：决定这条消息进哪条会话槽。
+   * 只用客观状态，不抠任务号：
+   *   ① 该 sender 在某 running 单上有未回填待决 → 进「本 agent 在该单的任务槽」
+   *   ② 否则该对话里该 sender 最近的一单还在跑 → 进那单的任务槽
+   *   ③ 都没有 → 前台槽（对话级）
+   * 任务归属仍由 LLM 的 `open_task` 定（含 `new`），所以这里判偏不锁死。
+   */
+  function routeInbound(
+    agentId: string,
+    channelKey: string,
+    providerId: string,
+    sessionParts: Record<string, string>,
+    sender: string,
+  ): { sessionKey: string; taskId?: string } {
+    const mine = { providerId, key: conversationKeyFor(providerId, sessionParts) }
+    const tasks = filterByConversation(listTasksIn('running'), mine, conversationKeyFor)
+      .filter((t) => t.sender === sender)
+      // local：可见性是"整台中枢一块板"，但**路由只续这条会话起过的单** ——
+      // 否则 sender 恒为 'local'，会让你在网页/会话里开个新话题也被吸进上一单。
+      .filter((t) => providerId !== 'local' || t.sessionParts.session === sessionParts.session)
+      .sort((a, b) => b.createdAt - a.createdAt)
+    const pending = tasks.filter((t) => t.pendingHuman !== undefined)
+    if (pending.length > 0) {
+      const t = pending[0]!
+      return { sessionKey: taskSlotKey(t.taskId, agentId), taskId: t.taskId }
+    }
+    if (tasks.length > 0) {
+      const t = tasks[0]!
+      return { sessionKey: taskSlotKey(t.taskId, agentId), taskId: t.taskId }
+    }
+    return { sessionKey: channelKey }
+  }
+
+  /** 入站绑定点：包入站 running 摘要（**只列本群**）；群快照由组员发现函数单独登记。 */
+  function boardContextFor(live: AgentConfig, providerId: string, sessionParts: Record<string, string>): { text: string; variables: Record<string, string> } {
+    // 卡片按需由 list_group_experts 取（hub 模式可能很多，不塞进 prompt）；这里只带本群 running 摘要。
+    const mine = { providerId, key: conversationKeyFor(providerId, sessionParts) }
+    const running = describeTasks(filterByConversation(listTasksIn('running'), mine, conversationKeyFor))
+    const lines: string[] = ['——本群任务板（specs/12）——']
+    if (running.length === 0) {
+      lines.push('（本群暂无 running 任务；你可以 open_task 新建一份，或直接自己做）')
+    } else {
+      for (const r of running) {
+        const ph = r.pendingHuman as undefined | { questions?: string[] }
+        const pending = ph === undefined ? '' : ` 待决:${String(ph.questions?.join('; ') ?? '')}`
+        lines.push(`- ${String(r.taskId)}: lead=${String(r.leadName ?? r.taskLead)}(${String(r.taskLead)}) sender=${String(r.sender)} access=${String(r.access)} 摘要=${String(r.summary ?? '')}${pending}`)
+      }
+      lines.push('（若是同一件事：open_task 捡起那一单；若是另一件事：open_task{new:true} 另起一单）')
+    }
+    void live
+    return { text: lines.join('\n'), variables: {} }
+  }
+
+  /**
+   * 本轮群成员快照（供 open_task 新建时写进任务文件）。
+   * 开关 `use_hub_experts=true`（默认）：中枢全集；否则问本通道 `listGroupAgents`。
+   * 两种都按 agents.json 过滤幽灵成员、去掉调用方自己（specs/12 §专家清单来源）。
+   */
+  function groupSnapshotFor(providerId: string, sessionParts: Record<string, string>, selfAgentId: string): GroupMember[] {
+    const cfgMap = new Map(listAgentConfigs().map((a) => [a.id, a]))
+    if (loadConfig().use_hub_experts !== false) {
+      return listAgentConfigs()
+        .filter((a) => a.id !== selfAgentId)
+        .map((a) => ({ agentId: a.id, name: a.name, description: a.description }))
+    }
+    const provider = providers.get(providerId)
+    const listed = provider?.listGroupAgents?.(sessionParts) ?? []
+    const out: GroupMember[] = []
+    for (const m of listed) {
+      if (m.agentId === '' || m.agentId === selfAgentId) continue
+      const cfg = cfgMap.get(m.agentId)
+      if (cfg === undefined) continue // 不在 agents.json：幽灵成员，丢掉
+      out.push({ agentId: m.agentId, name: cfg.name, description: cfg.description })
+    }
+    return out
+  }
+
+  // 看板工具挂载：每个 agent 会话 setup 时 scoped 注册。identity 从运行时会话映射解析。
+  const hostWithMount: HostServices = {
+    ...host,
+    toolsMount: () => (sessionId, agentId, agentName, agentCtx) => {
+      registerBoardTools(agentCtx, {
+        conversationKeyFor: (providerId, parts) => conversationKeyFor(providerId, parts),
+        agentIdentity: (sid) => runtime.identityFor(sid),
+        ensureAgent: (input) => runtime.ensureAgent(input),
+        agents: () => runtime.hostAgents(),
+      })
+      void agentId
+      void agentName
+      void sessionId
+    },
+  }
+  const runtime = createAgentRuntime(hostWithMount)
+
+  // 看板巡检器：扫描 running/ 收口叫醒/综合/超时。run() 常驻循环，service dispose 时 stop。
+  const patrol = createPatrol(
+    {
+      ensureAgent: (input) => runtime.ensureAgent(input),
+      agents: () => runtime.hostAgents(),
+      deliver: (providerId, sessionParts, messages) => {
+        const deliver = providerDeliver(providerId)
+        if (deliver === undefined) {
+          appendLog('deliver', `provider ${providerId} 未实现 deliver，收口只打日志: ${messages.map((m) => m.text).filter(Boolean).join(' ')}`)
+          return Promise.resolve()
+        }
+        return deliver({ sessionParts, messages })
+      },
+    },
+    {},
+  )
+  void patrol.start() // 启动补扫一次；之后完全由 agent/status / agent/disposed 事件驱动
+  service_notifyIdle = (sessionId: string): void => {
+    void patrol.reconcile(sessionId).catch(() => undefined)
+  }
+
+
+  /** 按 providerId 找通道的 deliver 能力（缺省打日志）。 */
+  function providerDeliver(providerId: string): ((req: AgentDeliverRequest) => Promise<void>) | undefined {
+    const info = providers.get(providerId)
+    return info?.deliver
+  }
+
+  return {
+    listAgents() {
+      return listAgentConfigs().map(toSummary)
+    },
+    getAgent(id: string) {
+      const found = getAgentConfig(id)
+      if (found === undefined) return undefined
+      return toSummary(found)
+    },
+    drainLocalInbox(sessionKey: string): AgentOutboundMessage[] {
+      const key = sessionKey === '' ? 'local' : sessionKey
+      const list = localInbox.get(key) ?? []
+      localInbox.delete(key)
+      return list
+    },
+    providerDeliver,
+    notifyAgentDisposed(sessionId: string): void {
+      void patrol.handleDisposed(sessionId).catch((err: unknown) => {
+        appendLog('patrol', `会话销毁处理失败 sid=${sessionId}: ${err instanceof Error ? err.message : String(err)}`)
+      })
+    },
+    notifySessionEvent(sessionId: string): void {
+      // 审批状态变了 → 复核这一单（检测与标记都在 patrol 里读会话日志得出）
+      void patrol.reconcile(sessionId).catch(() => undefined)
+    },
+    notifyAgentIdle(sessionId: string): void {
+      // 事件驱动快路径：不 await（事件是同步 emit，别拖慢派发链）
+      void patrol.reconcile(sessionId).catch((err: unknown) => {
+        appendLog('patrol', `事件复核失败 sid=${sessionId}: ${err instanceof Error ? err.message : String(err)}`)
+      })
+    },
+    listProviders() {
+      const out: AgentChannelProviderInfo[] = []
+      for (const [id, info] of providers) out.push({ id, label: info.label, listGroupAgents: info.listGroupAgents, deliver: info.deliver })
+      return out
+    },
+    registerProvider(reg: AgentChannelProviderRegistration) {
+      if (!reg.id) throw new Error('agent-bot: registerProvider 需要非空 id')
+      if (providers.has(reg.id)) {
+        console.warn(`agent-bot: provider ${reg.id} 重复注册，后写覆盖`)
+      }
+      const token = Symbol('agent-bot:provider-generation')
+      providers.set(reg.id, {
+        id: reg.id,
+        label: reg.label || reg.id,
+        token,
+        listGroupAgents: reg.listGroupAgents,
+        deliver: reg.deliver,
+      })
+      return () => {
+        const current = providers.get(reg.id)
+        if (current !== undefined && current.token === token) providers.delete(reg.id)
+      }
+    },
+    async ask(req: AgentAskRequest): Promise<AgentAskResponse> {
+      const prepared = prepareAsk(req, new Set(providers.keys()))
+      const queued = directAskPlacement(prepared.agent, req.targetWorkspace)
+      const queuedKey = prepared.sessionKey + queued.sessionKeySuffix
+      return enqueueHoldPending(queue, prepared.agent.id, queuedKey, prepared.agent.reuse_session, async () => {
+        const live = getAgentConfig(prepared.agent.id)
+        if (live === undefined) throw new Error(`agent-bot: 未知 agent ${prepared.agent.id}`)
+        const placement = directAskPlacement(live, req.targetWorkspace)
+        const current = { ...prepared, agent: live, sessionKey: prepared.sessionKey + placement.sessionKeySuffix }
+        // 会话分层：先软路由（可能进「本 agent 在该单的任务槽」），再按该槽的规则定 sessionId
+        // 直连带目标目录时不进旧任务槽：那些槽可能指着 cwd=目标项目的旧会话。
+        // 本轮会话开在专家 workspace，按目标分槽；产出靠 target_workspace，不靠 cwd。
+        const routed = placement.targetWorkspace !== ''
+          ? { sessionKey: current.sessionKey }
+          : routeInbound(live.id, current.sessionKey, req.meta.providerId, req.meta.sessionParts, req.meta.sender)
+        let sessionKey = routed.sessionKey
+        let decision: { sessionId: string }
+        if (routed.taskId !== undefined) {
+          const slot = live.sessions[sessionKey]
+          const archived = slot === undefined ? false : runtime.isArchived(slot.sessionId)
+          decision = archived || slot === undefined || slot.sessionId === ''
+            ? { sessionId: randomUUID() }
+            : { sessionId: slot.sessionId }
+          touchSession(live.id, sessionKey, decision.sessionId, Date.now(), '')
+        } else {
+          const slot = live.sessions[sessionKey]
+          const archived = slot === undefined ? false : runtime.isArchived(slot.sessionId)
+          decision = planSession({ ...current, sessionKey }, archived, Date.now(), randomUUID())
+          sessionKey = current.sessionKey
+        }
+        // 注意：路由**不**自动绑定。绑定只由 LLM 的 open_task 决定（specs/12：任务归属由模型定），
+        // 否则路由判偏后 LLM 想改认另一单会被「本会话已绑定 X，不能同时绑 Y」挡住。
+        const promptText = promptTextFor(live.id, live.prompt, live.skill_groups, live.prompt_append_skills)
+        const values = variableValues(req, sessionKey)
+        if (placement.targetWorkspace !== '') values.target_workspace = placement.targetWorkspace
+        // 会话 A 把活交给专家会话 B：followup 前建 job 并绑定 B。同一会话自己做完不建。
+        const caller = (req.meta.sessionParts.session ?? '').trim()
+        if (isCrossSessionHandoff(caller, decision.sessionId, callerIsAgentSession(caller))) {
+          ensureHandoffJob({
+            expertId: live.id,
+            expertName: live.name,
+            expertSessionId: decision.sessionId,
+            sender: req.meta.sender,
+            providerId: req.meta.providerId,
+            sessionParts: req.meta.sessionParts,
+            originContext: req.context,
+            target: placement.targetWorkspace,
+            groupSnapshot: groupSnapshotFor(req.meta.providerId, req.meta.sessionParts, live.id),
+          })
+        }
+        // 入站包装（specs/12 §入站怎么绑任务）：附本群 running 短摘要，让 LLM 认捡起/新建。
+        const boardCtx = boardContextFor(live, req.meta.providerId, req.meta.sessionParts)
+        // 人的回填：入站前记下"这一轮归属的任务"与待决时间；结束后若待决没被换掉就清掉。
+        // 优先用路由结果（会话可能还没被 open_task 绑定），其次看已绑定任务。
+        const boundBefore = routed.taskId ?? boundTaskId(decision.sessionId)
+        const pendingBefore = boundBefore === undefined
+          ? undefined
+          : readTaskModel('running', boundBefore)?.pendingHuman?.askedAt
+        // 入站上下文（specs/12 §入站怎么绑任务）：记下 sender/providerId/群快照，
+        // 供本轮模型调 open_task 新建任务时取用（工具作用域里本来没有这些）。
+        rememberInbound(decision.sessionId, {
+          sender: req.meta.sender,
+          providerId: req.meta.providerId,
+          sessionParts: req.meta.sessionParts,
+          originContext: req.context,
+          groupSnapshot: groupSnapshotFor(req.meta.providerId, req.meta.sessionParts, live.id),
+        })
+        const promptTextForAgent = live.prompt_placement === 'user' ? '' : promptText
+        const agent = await runtime.ensureAgent({
+          sessionId: decision.sessionId,
+          cwd: placement.cwd,
+          agentId: live.id,
+          agentName: live.name,
+          promptText: promptTextForAgent,
+          variables: { ...values, ...boardCtx.variables },
+          permissionMode: live.permission_mode,
+        })
+        const followupContext =
+          live.prompt_placement === 'user'
+            ? appendPromptToUserContext(req.context, promptText, values)
+            : req.context
+        const contextWithBoard = boardCtx.text === '' ? followupContext : `${followupContext}\n\n${boardCtx.text}`
+        const contextForAgent = placement.notice === '' ? contextWithBoard : `${contextWithBoard}\n\n${placement.notice}`
+        // 出站模式按**通道能力**分档（specs/12 §入站出站）：
+        //   通道有 deliver → 异步：立刻回一条回执，这一轮的产出等回合结束经 deliver 推回去
+        //   通道没 deliver → 同步：一直等到这一轮 idle，不设等待上限
+        const canPush = providers.get(req.meta.providerId)?.deliver !== undefined
+        if (canPush) {
+          const firstSeq = await startFollowupTurn(agent, contextForAgent)
+          // 回合结束后的两件事（清人的回填待决 + 交互兜底）必须放进后台任务：
+          // 异步分支在回合跑完**之前**就返回了，不能在返回路径上做。
+          void pushRoundResult(agent, req, decision.sessionId, firstSeq, boundBefore, pendingBefore)
+          touchSession(
+            live.id,
+            sessionKey,
+            decision.sessionId,
+            Date.now(),
+            promptFingerprintFor(live.prompt, live.prompt_placement, live.skill_groups, live.prompt_append_skills),
+          )
+          return {
+            messages: [{ kind: 'text', text: `已接，正在处理（agent「${live.name}」）`, url: '', atUserIds: [], atAll: false }],
+            pending: null,
+          }
+        }
+        const result = await settleAskRound(agent, contextForAgent, 0)
+        // 落的是**实际用的那条槽**（软路由可能把它放进了任务槽）
+        touchSession(
+          live.id,
+          sessionKey,
+          decision.sessionId,
+          Date.now(),
+          promptFingerprintFor(live.prompt, live.prompt_placement, live.skill_groups, live.prompt_append_skills),
+        )
+        // 人 @ 了 lead 并说完这一轮 → 旧问卷视为已回填（同一 askedAt 才清；换了新问题就保留）
+        clearAnsweredPending(boundBefore, pendingBefore)
+        finishSelfDoneHandoff(decision.sessionId)
+        // 交互兜底：只要还有人跟这单互动，漏掉的事件就能在这一刻补上（不再有周期巡检）
+        service_notifyIdle(decision.sessionId)
+        return result
+      })
+    },
+    async localAsk(rawInput: string, sessionKey = 'local', targetWorkspace?: string): Promise<{ messages: AgentOutboundMessage[]; error?: string }> {
+      // rawInput 第一 token = agent 标识（id 精确 / name 精确 / name 大小写不敏感），剩余 = 问题
+      const trimmed = rawInput.trim()
+      const sp = trimmed.indexOf(' ')
+      const key = sp < 0 ? trimmed : trimmed.slice(0, sp)
+      const question = sp < 0 ? '' : trimmed.slice(sp + 1).trim()
+      if (key === '') return { messages: [], error: '请输入：/agent <名字或id> <问题>' }
+      const agents = listAgentConfigs()
+      const match =
+        agents.find((a) => a.id === key) ??
+        agents.find((a) => a.name === key) ??
+        agents.find((a) => a.name.toLowerCase() === key.toLowerCase())
+      if (match === undefined) return { messages: [], error: `找不到 agent：${key}` }
+      if (question === '') return { messages: [], error: `请输入问题：/agent ${match.name} <问题>` }
+      try {
+        const result = await this.ask({
+          agentId: match.id,
+          context: '用户[local]: ' + question,
+          targetWorkspace,
+          meta: {
+            traceId: randomUUID(),
+            providerId: 'local',
+            sessionParts: { session: sessionKey },
+            sender: 'local',
+          },
+        })
+        const all: AgentOutboundMessage[] = [...result.messages]
+        if (result.pending !== null) all.push(...(await result.pending))
+        return { messages: all }
+      } catch (err) {
+        return { messages: [], error: err instanceof Error ? err.message : String(err) }
+      }
+    },
+    async dispose() {
+      patrol.stop()
+      await runtime.disposeAll()
+    },
+  }
+}

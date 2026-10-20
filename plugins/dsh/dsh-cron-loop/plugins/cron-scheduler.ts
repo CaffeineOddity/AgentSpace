@@ -1,0 +1,726 @@
+// cron-loop 调度器：30s tick 扫描到期任务，创建/续接会话执行任务 prompt。
+// 同时注册模型工具 `cron_job`（add/list/update/remove/pause/resume/runs）。
+//
+// 会话模型：每个 job 首次执行时生成随机 session id 并存入 job 记录，
+// 之后每次执行都在该固定会话里 resume；进程重启后靠 persistence 恢复。
+//   whenIdle -> followup(prompt) -> whenIdle -> flush -> 取本轮最后一条 assistant 文本。
+
+import type { Context } from '@deepseek-ai/cordis'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import { randomUUID } from 'node:crypto'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import '@deepseek-ai/cordis-plugin-timer' // 激活 Context.timer 类型扩展
+import '@deepseek-ai/dsh-agent-presets' // 激活 Context.agentPresets 类型扩展
+import '@deepseek-ai/dsh-agent-default-model' // 激活 Context.agentDefaultModel 类型扩展
+import '@deepseek-ai/dsh-system-prompt' // 激活 Context.systemPrompt 类型扩展
+import { computeNextRun, matches, parseCron } from './lib/cron-core.ts'
+import { summarizeOwnedInterval, waitIdleOrTimeout } from './lib/agent-run.ts'
+import { ModelPool } from './lib/model-pool.ts'
+import type { ModelSelection } from './lib/model-pool.ts'
+import type { CronJobRecord, CronRunRecord } from './cron-store.ts'
+import { normalizeCwd, normalizeModel } from './cron-store.ts'
+
+/** 调度 tick 间隔（ms）：分钟级任务的最大触发延迟。 */
+const TICK_MS = 30_000
+
+/** 单轮执行的安全阀（ms）：超时后按当前文本收口，agent 后台继续。 */
+const RUN_TIMEOUT_MS = 10 * 60_000
+
+/** 本插件 create/resume 得到的 handle（卸载时统一 dispose）。 */
+const handles = new Map<string, AgentHandle>()
+
+/** 每个会话的可变模型选择：换模型靠 installModelSelection 挂到 agent.ctx。
+ *  键 = sessionId，value 持有目标 agent（判断是否已装）与可变 ref。agent 卸载时其 ctx 随
+ *  cordis scope 一起回收，这里不显式 dispose，仅在 agent 重建时删除旧条目。 */
+const liveModelSelections = new Map<string, { agent: Agent; ref: ModelSelectionRef }>()
+
+/** 给一个 agent 应用目标模型（可变选择，下一次 step 生效）。live / resume / create 后通用：
+ *  live 会话的 agent.options 固定，只能靠它换模型；resume/create 后也再挂一层，兜底 resume 不走 agentOptions 的情况。
+ *  modelOverride 为空表示「用 agent 创建时模型（DSH 默认）」，清空已装覆盖即可。 */
+function applyAgentModel(agent: Agent, key: string, modelOverride?: ModelSelection): void {
+  const next = modelOverride === undefined ? undefined : { provider: modelOverride.provider, model: modelOverride.model }
+  const entry = liveModelSelections.get(key)
+  if (entry !== undefined && entry.agent === agent) {
+    entry.ref.current = next
+    return
+  }
+  if (entry !== undefined) liveModelSelections.delete(key) // agent 已重建，旧 ref 随旧 ctx 失效
+  if (next === undefined) return
+  const ref: ModelSelectionRef = { current: next, assembled: undefined }
+  installModelSelection(agent.ctx, ref)
+  liveModelSelections.set(key, { agent, ref })
+}
+
+/** 全局模型池实例（apply 时加载，调度/触发时读最新可用模型）。 */
+let modelPool: ModelPool | null = null
+
+/** LLM 失败的最小投影（从 turn/end 事件提取）。 */
+interface LlmFailureInfo {
+  code: string
+  message: string
+}
+
+/** 从 turn/end 事件提取 LLM 失败信息（如果有）。 */
+function extractLlmFailure(events: readonly { seq: number; type: string; data?: unknown }[], firstSeq: number): LlmFailureInfo | null {
+  for (const event of events) {
+    if (event.seq < firstSeq) continue
+    if (event.type !== 'turn/end') continue
+    const data = event.data as { reason?: { kind?: string; error?: { code?: string; message?: string } } } | undefined
+    const reason = data?.reason
+    if (reason?.kind === 'error' && reason.error !== undefined) {
+      return { code: reason.error.code ?? 'UNKNOWN', message: reason.error.message ?? '' }
+    }
+  }
+  return null
+}
+
+/** 可切换下一个可用模型重试的失败码（模型池场景）。 */
+function isSwitchableCode(code: string): boolean {
+  return code === 'QUOTA' || code === 'INVALID_CREDENTIAL' || code === 'AUTH'
+}
+
+/** 模型池里标记 exhausted 时是否「永久不可恢复」（只有 INVALID_CREDENTIAL 是）。 */
+function isPermanentFailureCode(code: string): boolean {
+  return code === 'INVALID_CREDENTIAL'
+}
+
+/** 同一 job 的执行串行标记（防重入：一个 job 同时至多一个在途执行）。 */
+const inFlight = new Set<string>()
+
+/** persistence.list() 的最小形状（宿主 web profile 必有该服务）。 */
+interface PersistenceList {
+  list(): Promise<Array<{ id: string; cwd?: string }>>
+}
+
+/** 判断会话是否已被归档（web UI 从分组视图隐藏）。无 workspaceRegistry 时保守视为未归档。 */
+function isArchived(ctx: Context, sessionId: string): boolean {
+  const registry = ctx.get('workspaceRegistry') as { archivedSessionIds?: readonly string[] } | undefined
+  if (registry?.archivedSessionIds === undefined) return false
+  return registry.archivedSessionIds.includes(sessionId)
+}
+
+/** 磁盘（persistence.list）是否已有该会话；无 persistence 服务时退回内存 store。 */
+async function isPersisted(ctx: Context, sid: SessionId): Promise<boolean> {
+  const persistence = ctx.get('sessionPersistence') as PersistenceList | undefined
+  if (persistence === undefined) return ctx.sessions.get(sid) !== undefined
+  const headers = await persistence.list()
+  return headers.some((header) => header.id === sid)
+}
+
+
+/** 可选权限模式与 preset 名同名（read-only / workspace-write / danger-full-access）。
+ * 对齐 dsh-base/cordis.patch.yml 里的 preset 表配置。 */
+const PERMISSION_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const
+const PRESET_SPEC: Record<string, { sandbox: string; approval: 'ask' | 'never' }> = {
+  'read-only': { sandbox: 'read-only', approval: 'ask' },
+  'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
+  'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
+}
+
+/** 给会话写权限 preset 三元组（permission/preset + sandbox/mode + approval/policy）。
+ * 对齐 ruliu-bridge 的 applyFullAccess：通过 handle 的 session 直接 append，
+ * 避免依赖 agentCtx.agent 的注入。 */
+function applyPermission(session: unknown, permissionMode: string): void {
+  const spec = PRESET_SPEC[permissionMode] ?? PRESET_SPEC['danger-full-access']
+  if (spec === undefined) return
+  const s = session as { append(type: string, data: Record<string, unknown>): unknown } | undefined
+  if (s === undefined) return
+  s.append('permission/preset', { preset: permissionMode })
+  s.append('sandbox/mode', { mode: spec.sandbox })
+  s.append('approval/policy', { policy: spec.approval })
+}
+
+/** 组装 cron 会话的 scoped world：挂宿主 `standard` preset + systemPrompt。
+ * 对齐 ruliu-bridge：setup 只组世界，不碰 agent（agent 由 create/resume 返回后通过 handle 访问）。 */
+async function setupAgent(ctx: Context, agentCtx: Context, jobId: string): Promise<void> {
+  await ctx.agentPresets.mount(agentCtx, 'standard')
+  agentCtx.systemPrompt.section({
+    name: 'cron-loop:job',
+    order: 1,
+    text: '你是一次定时任务（cron-loop）的执行会话。按用户消息里的任务说明完成工作，产出尽量精炼的结论。',
+  })
+}
+
+/** 确保目标会话有 live agent：已 live 直接取，否则按磁盘状态 resume/create。
+ * 对齐 ruliu-bridge 的 ensureAgent 模式（照搬 lifecycle 判定 + 自愈）。
+ * 返回值含最终使用的 sessionId（可能因归档/损坏而变化）。 */
+async function ensureAgent(ctx: Context, sid: SessionId, jobId: string, cwd: string, permissionMode: string, modelOverride?: ModelSelection): Promise<{ agent: Agent; sessionId: string }> {
+  const live = ctx.agents.get(sid)
+  const persisted = await isPersisted(ctx, sid)
+  // lifecycle: live 已在内存；resume 磁盘有但内存无；create 都无。
+  const lifecycle = live !== undefined ? 'live' : persisted ? 'resume' : 'create'
+  ctx.logger?.info?.(`cron-scheduler: ensureAgent job=${jobId} sid=${String(sid)} lifecycle=${lifecycle} cwd=${cwd}${modelOverride !== undefined ? ` model=${modelOverride.id}` : ''}`)
+  if (lifecycle === 'live') {
+    if (live === undefined) throw new Error(`cron-scheduler: session ${sid} resolved live but agents.get returned undefined`)
+    // live 会话的 agent.options 在 create/resume 时固定；按目标模型（固定模型/模型池）换模型，
+    // 否则池子/固定模型对 live 会话永不生效。用 installModelSelection 保会话不动。
+    applyAgentModel(live, String(sid), modelOverride)
+    return { agent: live, sessionId: String(sid) }
+  }
+  // 模型选择：优先用 modelOverride（模型池），否则用 agentDefaultModel。
+  const selection = modelOverride ?? ctx.agentDefaultModel.currentSelection()
+  if (selection.provider === '' || selection.model === '') {
+    throw new Error(`cron-scheduler: no default model for job ${jobId} - set agent-default-model in ~/.dsh/settings.yaml`)
+  }
+  const opts = {
+    agentOptions: { provider: selection.provider, model: selection.model },
+    setup: async (agentCtx: Context): Promise<void> => {
+      await setupAgent(ctx, agentCtx, jobId)
+    },
+  }
+  let handle: AgentHandle
+  let finalSid: string = String(sid)
+  if (lifecycle === 'resume') {
+    try {
+      handle = await ctx.agents.resume({ resumeSessionId: sid, ...opts })
+    } catch (error: unknown) {
+      // 会话损坏（seq gap、corrupt log 等）-> 生成新 UUID 重建会话。
+      const msg = error instanceof Error ? error.message : String(error)
+      if (msg.includes('corrupt') || msg.includes('seq gap') || msg.includes('collision') || msg.includes('does not match')) {
+        ctx.logger?.warn?.(`cron-scheduler: session ${sid} unusable (${msg.slice(0, 80)}), creating new session for job ${jobId}`)
+        finalSid = randomUUID()
+        handle = await ctx.agents.create({ sessionId: SessionId(finalSid), meta: { cwd }, ...opts })
+      } else {
+        throw error
+      }
+    }
+  } else {
+    // create：首次执行或会话被归档后重建。
+    try {
+      handle = await ctx.agents.create({ sessionId: sid, meta: { cwd }, ...opts })
+      // 把新会话注册到 workspace，让 webUI 侧边栏归到正确项目分组。
+      // create(cwd) 创建/复用 workspace，attachSession 把 session 加入 sessionIds。
+      const registry = ctx.get('workspaceRegistry') as {
+        create(path: string): Promise<{ attachSession(sessionId: string): Promise<void> }>
+      } | undefined
+      if (registry !== undefined) {
+        try {
+          const ws = await registry.create(cwd)
+          await ws.attachSession(String(sid))
+        } catch (e: unknown) {
+          ctx.logger?.warn?.(`cron-scheduler: workspaceRegistry create+attach(${cwd}, ${sid}) failed: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error)
+      if (msg.includes('collision') || msg.includes('already has a persisted')) {
+        handle = await ctx.agents.resume({ resumeSessionId: sid, ...opts })
+      } else {
+        throw error
+      }
+    }
+  }
+  const key = finalSid
+  // 权限写到 create/resume 之后，通过 handle.agent.session 直接 append，
+  // 避免在 setup 回调里访问 agentCtx.agent（会触发 inject 检查）。
+  applyPermission(handle.agent.session, permissionMode)
+  // resume/create 后也挂一层模型选择，兜底 resume 不走 agentOptions 换模型的情况。
+  applyAgentModel(handle.agent, finalSid, modelOverride)
+  const previous = handles.get(key)
+  handles.set(key, handle)
+  if (previous !== undefined && previous !== handle) {
+    void previous.dispose()
+  }
+  return { agent: handle.agent, sessionId: finalSid }
+}
+
+/**
+ * read-modify-write：从 store 读最新 job，只合并运行态字段后写回。
+ * 防止 runJob 执行期间用户通过 PUT 更新的 prompt/name/cron 等被旧快照覆盖。
+ */
+async function mergeJobUpdate(store: { jobs: { get(id: string): CronJobRecord | undefined }; putJob(job: CronJobRecord): Promise<void> }, jobId: string, patch: Partial<CronJobRecord>): Promise<void> {
+  const current = store.jobs.get(jobId)
+  if (current === undefined) return // job 已被删除，丢弃更新
+  await store.putJob({ ...current, ...patch })
+}
+
+/**
+ * 终态计数：total 在每轮结束（成功或失败）时 +1，ok 仅成功时 +1。
+ * 用 read-modify-write 递增而非绝对值赋值，避免重试/换模型等一轮多次收口互相覆盖。
+ * 模型池耗尽等「本轮未真正执行」的提前返回不计入。
+ */
+function countRun(job: CronJobRecord, succeeded: boolean): CronJobRecord['runStats'] {
+  const stats = job.runStats ?? { total: 0, ok: 0 }
+  return { total: stats.total + 1, ok: stats.ok + (succeeded ? 1 : 0) }
+}
+/** 执行一个到期任务：写 running run -> agent 回合 -> 收口写结果 run。
+ * 支持模型池：每轮选优先级最高的可用模型，额度耗尽自动切换下一个重试。 */
+async function runJob(ctx: Context, job: CronJobRecord): Promise<void> {
+  const store = ctx.cronLoopStore
+  if (store.jobs.get(job.id) === undefined) {
+    ctx.logger?.warn?.(`cron-scheduler: job ${job.id} no longer in store, skipping runJob`)
+    return
+  }
+  // inFlight 由 runJob 统一持有：入口 add，finally 释放。tick/trigger 只做检查，
+  // 链式续跑先释放再同步进入下一轮 runJob（无 await 间隙，不会与 tick 竞争）。
+  if (inFlight.has(job.id)) {
+    // 上一次执行还在跑：本次触发记 break（非 error），等下一个 cron 时机。
+    ctx.logger?.info?.(`cron-scheduler: job ${job.id} previous run still in flight, skipping this trigger (break)`)
+    const breakRun: CronRunRecord = {
+      id: `run-${job.id}-${Date.now()}`,
+      jobId: job.id,
+      jobName: job.name,
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      status: 'break',
+      summary: '上次执行仍在进行，本次触发跳过（break）',
+    }
+    await store.putRun(breakRun)
+    await mergeJobUpdate(store, job.id, { lastRunAt: breakRun.startedAt, lastStatus: 'break', updatedAt: Date.now() })
+    return
+  }
+  inFlight.add(job.id)
+  const runId = `run-${job.id}-${Date.now()}`
+  const startedAt = Date.now()
+  const running: CronRunRecord = { id: runId, jobId: job.id, jobName: job.name, startedAt, status: 'running' }
+  await store.putRun(running)
+  await mergeJobUpdate(store, job.id, { lastRunAt: startedAt, lastStatus: 'running' })
+
+  // 模型选择优先级：任务固定模型 > 模型池（优先级最高可用） > DSH 默认。
+  // 先 reload 再判断 isEnabled：否则用的是启动时的内存缓存，用户刚清空/改动池子
+  // 会被误判进池子分支，把「未配置」当成「全部耗尽」。
+  let modelOverride: ModelSelection | undefined = undefined
+  let fromPool = false
+  const pin = job.model
+  if (pin !== undefined) {
+    modelOverride = { id: `${pin.provider}/${pin.model}`, provider: pin.provider, model: pin.model }
+  } else if (modelPool !== null) {
+    await modelPool.reload()
+    if (modelPool.isEnabled) {
+      const picked = modelPool.pickAvailable()
+      if (picked === null) {
+        // 所有模型额度用光 -> 暂停任务
+        const msg = 'all models exhausted'
+        ctx.logger?.warn?.(`cron-scheduler: job ${job.id} ${msg}, pausing`)
+        await store.putRun({ ...running, finishedAt: Date.now(), status: 'error', error: msg })
+        await mergeJobUpdate(store, job.id, { lastRunAt: startedAt, lastStatus: 'error', updatedAt: Date.now(), enabled: false })
+        return
+      }
+      modelOverride = picked
+      fromPool = true
+    }
+  }
+
+  ctx.logger?.info?.(`cron-scheduler: job ${job.id} (${job.name}) fired${modelOverride !== undefined ? ` model=${modelOverride.id}` : ''}`)
+  let succeeded = false
+  try {
+    const result = await executeRound(ctx, job, running, startedAt, modelOverride)
+    succeeded = result.succeeded
+    // 只有来自模型池的模型才做「换下一个模型重试」；固定模型失败直接记 error，不回落模型池。
+    if (!succeeded && result.failure !== null && fromPool && modelPool !== null) {
+      const failure = result.failure
+      if (isSwitchableCode(failure.code)) {
+        ctx.logger?.warn?.(`cron-scheduler: job ${job.id} model ${modelOverride?.id} ${failure.code}, marking exhausted`)
+        await modelPool.markExhausted(modelOverride!.id, isPermanentFailureCode(failure.code))
+        const nextModel = modelPool.pickAvailable()
+        if (nextModel !== null) {
+          ctx.logger?.info?.(`cron-scheduler: job ${job.id} switching to model ${nextModel.id}, retrying`)
+          const retryResult = await executeRound(ctx, job, { ...running, id: `run-${job.id}-${Date.now()}` }, Date.now(), nextModel)
+          succeeded = retryResult.succeeded
+          if (!succeeded && retryResult.failure !== null && isSwitchableCode(retryResult.failure.code)) {
+            await modelPool.markExhausted(nextModel.id, isPermanentFailureCode(retryResult.failure.code))
+          }
+        } else {
+          ctx.logger?.warn?.(`cron-scheduler: job ${job.id} all models exhausted after retry, pausing`)
+          await mergeJobUpdate(store, job.id, { lastStatus: 'error', updatedAt: Date.now(), enabled: false })
+        }
+      }
+    }
+  } catch (error: unknown) {
+    const finishedAt = Date.now()
+    const message = error instanceof Error ? error.message : String(error)
+    await store.putRun({ ...running, finishedAt, status: 'error', error: message })
+    await mergeJobUpdate(store, job.id, { lastRunAt: startedAt, lastStatus: 'error', updatedAt: finishedAt, runStats: countRun(job, false) })
+    ctx.logger?.error?.(`cron-scheduler: job ${job.id} failed: ${message}`)
+  } finally {
+    const latest = store.jobs.get(job.id)
+    const chain = succeeded && latest?.continuous === true && latest.enabled === true
+    if (chain) ctx.logger?.info?.(`cron-scheduler: job ${job.id} continuous -> chaining next round`)
+    // 先释放标记，再同步进入下一轮 runJob（其入口会立刻 add，无竞态窗口）。
+    inFlight.delete(job.id)
+    if (chain && latest !== undefined) void runJob(ctx, latest)
+    // 成功后激活：B 立即进入 running，nextRunAt 由 tick 顺延；B 不在则跳过（警告）。
+    // 本任务（A）已被暂停（enabled=false）时不激活，避免停用的任务继续驱动下游链路。
+    if (succeeded && latest !== undefined && latest.enabled === true && latest.activateOnSuccess !== undefined && latest.activateOnSuccess !== '') {
+      const targetId = latest.activateOnSuccess
+      if (targetId === latest.id) {
+        ctx.logger?.warn?.(`cron-scheduler: job ${latest.id} activateOnSuccess points to itself, skipping`)
+      } else {
+        const target = store.jobs.get(targetId)
+        if (target === undefined) {
+          ctx.logger?.warn?.(`cron-scheduler: job ${latest.id} activateOnSuccess target ${targetId} not found, skipping`)
+        } else if (inFlight.has(targetId)) {
+          ctx.logger?.warn?.(`cron-scheduler: job ${latest.id} activateOnSuccess target ${targetId} already running, skipping`)
+        } else {
+          ctx.logger?.info?.(`cron-scheduler: job ${latest.id} done -> activate ${targetId} (running)`)
+          // 顺延：先把 B 置为 running 状态并确保 enabled，再进入 runJob（入口 inFlight.add）。
+          await mergeJobUpdate(store, targetId, { enabled: true, updatedAt: Date.now(), lastStatus: 'running' })
+          const activated = store.jobs.get(targetId)
+          if (activated !== undefined) void runJob(ctx, activated)
+        }
+      }
+    }
+  }
+}
+
+/** 单轮执行结果。 */
+interface RoundResult {
+  succeeded: boolean
+  failure: LlmFailureInfo | null
+}
+
+/** 执行单轮 agent 回合：ensureAgent -> followup -> whenIdle -> 收口。
+ * modelOverride 为模型池选的模型；undefined 时用 agentDefaultModel。 */
+async function executeRound(ctx: Context, job: CronJobRecord, running: CronRunRecord, startedAt: number, modelOverride: ModelSelection | undefined): Promise<RoundResult> {
+  const store = ctx.cronLoopStore
+  // 会话策略：newSessionPerRun=true 每轮新会话；缺省沿用 job.sessionId 续跑，
+  // 仅当它已归档（或首次执行无 sessionId）时才新建。模型池换模型走 resume，
+  // 由 agentOptions 传入新模型，不再强制换会话。
+  let sessionStr = job.sessionId ?? randomUUID()
+  if (job.newSessionPerRun === true) {
+    sessionStr = randomUUID()
+  } else if (job.sessionId !== undefined && isArchived(ctx, job.sessionId)) {
+    sessionStr = randomUUID()
+  }
+  const sid = SessionId(sessionStr)
+  try {
+    const { agent, sessionId: actualSid } = await ensureAgent(ctx, sid, job.id, job.cwd, job.permissionMode ?? 'danger-full-access', modelOverride)
+    await mergeJobUpdate(store, job.id, { sessionId: actualSid })
+    const pre = await waitIdleOrTimeout(agent.whenIdle(), RUN_TIMEOUT_MS)
+    if (pre === 'timeout') throw new Error(`cron-scheduler: job ${job.id} agent not idle within ${RUN_TIMEOUT_MS}ms (pre-turn)`)
+    const firstSeq = agent.session.seq
+    agent.followup(createUserMessage({
+      content: [{ type: 'text', text: job.prompt }],
+      source: { kind: 'user' },
+    }))
+    const wait = await waitIdleOrTimeout(agent.whenIdle(), RUN_TIMEOUT_MS)
+    const events = agent.session.snapshotEvents(firstSeq) as readonly { seq: number; type: string; data?: unknown }[]
+    const failure = extractLlmFailure(events, firstSeq)
+    const text = summarizeOwnedInterval(events, firstSeq)
+    await ctx.sessions.flush(agent.session)
+    const finishedAt = Date.now()
+    if (failure !== null) {
+      const summary = text !== '' ? text.slice(0, 500) : `模型失败: ${failure.code} - ${failure.message}`.slice(0, 500)
+      await store.putRun({ ...running, finishedAt, status: 'error', sessionId: actualSid, error: `${failure.code}: ${failure.message}`, summary })
+      await mergeJobUpdate(store, job.id, { sessionId: actualSid, lastRunAt: startedAt, lastStatus: 'error', updatedAt: finishedAt, runStats: countRun(job, false) })
+      ctx.logger?.error?.(`cron-scheduler: job ${job.id} turn ended with error: ${failure.code}: ${failure.message}`)
+      return { succeeded: false, failure }
+    }
+    if (wait === 'timeout') {
+      // 超时≠成功：agent 可能仍在执行本轮。记 error 且不链下一轮，
+      // 后续轮次的 pre-turn whenIdle 会等它真正空闲再注入，不会重叠。
+      const summary = text !== '' ? text.slice(0, 500) : '执行超时，未产生最终文本'
+      await store.putRun({ ...running, finishedAt, status: 'error', sessionId: actualSid, error: 'TIMEOUT: 执行超时，agent 未在时限内结束本回合', summary })
+      await mergeJobUpdate(store, job.id, { sessionId: actualSid, lastRunAt: startedAt, lastStatus: 'error', updatedAt: finishedAt, runStats: countRun(job, false) })
+      ctx.logger?.error?.(`cron-scheduler: job ${job.id} turn timed out after ${RUN_TIMEOUT_MS}ms`)
+      return { succeeded: false, failure: null }
+    }
+    const summary = text !== ''
+      ? text.slice(0, 500)
+      : '执行完成（无文本输出）'
+    await store.putRun({ ...running, finishedAt, status: 'ok', sessionId: actualSid, summary })
+    await mergeJobUpdate(store, job.id, { sessionId: actualSid, lastRunAt: startedAt, lastStatus: 'ok', updatedAt: finishedAt, runStats: countRun(job, true) })
+    ctx.logger?.info?.(`cron-scheduler: job ${job.id} finished ok in ${finishedAt - startedAt}ms`)
+    return { succeeded: true, failure: null }
+  } catch (error: unknown) {
+    const finishedAt = Date.now()
+    const message = error instanceof Error ? error.message : String(error)
+    await store.putRun({ ...running, finishedAt, status: 'error', sessionId: String(sid) !== '' ? String(sid) : undefined, error: message })
+    await mergeJobUpdate(store, job.id, { lastRunAt: startedAt, lastStatus: 'error', updatedAt: finishedAt, runStats: countRun(job, false) })
+    ctx.logger?.error?.(`cron-scheduler: job ${job.id} round failed: ${message}`)
+    return { succeeded: false, failure: { code: 'UNKNOWN', message } }
+  }
+}
+
+/** 一个 tick：刷新 nextRunAt，触发到期且未在途的任务。 */
+async function tick(ctx: Context): Promise<void> {
+  const store = ctx.cronLoopStore
+  const now = Date.now()
+  // 模型池恢复检查：已耗尽模型重置周期到了 -> 恢复（pickAvailable 内部处理）。
+  if (modelPool !== null && modelPool.isEnabled) {
+    void modelPool.reload().then(() => { modelPool?.pickAvailable() })
+  }
+  for (const job of store.listJobs()) {
+    if (!job.enabled) {
+      if (job.nextRunAt !== undefined) {
+        await store.jobs.put(job.id, { ...job, nextRunAt: undefined })
+      }
+      continue
+    }
+    let plan
+    try {
+      plan = parseCron(job.cron)
+    } catch (error: unknown) {
+      const reason = error instanceof Error ? error.message : String(error)
+      ctx.logger?.error?.(`cron-scheduler: job ${job.id} has invalid cron "${job.cron}": ${reason}`)
+      continue
+    }
+    // nextRunAt 仅用于展示「下次触发时间」，取严格晚于当前时刻的下次匹配。
+    const next = computeNextRun(plan, new Date(now))
+    if (job.nextRunAt !== next.getTime()) {
+      await store.jobs.put(job.id, { ...job, nextRunAt: next.getTime() })
+    }
+    // 触发判定：当前分钟是否命中 cron 计划。tick 每 30s 扫一次，同一分钟内
+    // 可能命中两次，但 inFlight 标记保证一个 job 同时至多一个在途执行。
+    if (matches(plan, new Date(now)) && !inFlight.has(job.id)) {
+      const current = store.jobs.get(job.id)
+      void runJob(ctx, current ?? { ...job, nextRunAt: next.getTime() })
+    }
+  }
+}
+
+/** 调度器对外能力（trigger 由 scheduler 的 ctx 执行，避免调用方 ctx 缺 inject）。 */
+export interface CronLoopScheduler {
+  triggerJobNow(jobId: string): Promise<void>
+}
+
+/** scheduler 激活后暴露的服务句柄；未激活时为 undefined。 */
+let schedulerApi: CronLoopScheduler | undefined
+
+/** 获取 scheduler 服务句柄；未激活时抛清晰错误。 */
+export function getCronLoopScheduler(): CronLoopScheduler {
+  if (schedulerApi === undefined) throw new Error('cron-scheduler is not active')
+  return schedulerApi
+}
+
+/** 立即执行一次任务（服务入口：经 scheduler 自己的 ctx 执行，供工具/命令/Web 使用）。 */
+async function triggerJobNowOn(ctx: Context, jobId: string): Promise<void> {
+  const job = ctx.cronLoopStore.jobs.get(jobId)
+  if (job === undefined) throw new Error(`cron-scheduler: job ${jobId} not found`)
+  if (inFlight.has(jobId)) {
+    ctx.logger?.info?.(`cron-scheduler: job ${jobId} already running, skip manual trigger (break)`)
+    return
+  }
+  await runJob(ctx, job)
+}
+
+/** 新建任务的公共入口（工具/命令/Web 共用）：校验 cron、生成 id、落盘。 */
+export async function createJob(
+  ctx: Context,
+  input: { name?: string; cwd: string; cron: string; prompt: string; enabled?: boolean; permissionMode?: string; continuous?: boolean; newSessionPerRun?: boolean; activateOnSuccess?: string; model?: { provider?: string; model?: string } },
+): Promise<CronJobRecord> {
+  parseCron(input.cron) // 非法即抛 CronParseError
+  const cwd = normalizeCwd(input.cwd)
+  if (cwd === '' || !cwd.startsWith('/')) {
+    throw new Error(`cron-scheduler: cwd must be an absolute path (after ~ expansion), got "${input.cwd}"`)
+  }
+  const store = ctx.cronLoopStore
+  const now = Date.now()
+  // 任务 id：创建时刻 `年月日时分秒.毫秒`（本地时间，补零）；同毫秒冲突时递增毫秒。
+  const t = new Date(now)
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  const p3 = (n: number) => String(n).padStart(3, '0')
+  const formatStamp = (d: Date) =>
+    `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}.${p3(d.getMilliseconds())}`
+  let id = formatStamp(t)
+  const existing = store.listJobs().map((job) => job.id)
+  while (existing.includes(id)) {
+    t.setMilliseconds(t.getMilliseconds() + 1)
+    id = formatStamp(t)
+  }
+  const fallbackName = input.prompt.replace(/\s+/g, ' ').trim().slice(0, 24) || '未命名任务'
+  const job: CronJobRecord = {
+    id,
+    name: input.name !== undefined && input.name !== '' ? input.name : fallbackName,
+    cwd,
+    cron: input.cron,
+    prompt: input.prompt,
+    enabled: input.enabled ?? true,
+    permissionMode: input.permissionMode ?? 'danger-full-access',
+    continuous: input.continuous ?? false,
+    newSessionPerRun: input.newSessionPerRun ?? false,
+    activateOnSuccess: input.activateOnSuccess !== undefined && input.activateOnSuccess !== '' ? input.activateOnSuccess : undefined,
+    model: normalizeModel(input.model),
+    timezone: 'local',
+    createdAt: now,
+    updatedAt: now,
+  }
+  await store.putJob(job)
+  ctx.logger?.info?.(`cron-scheduler: job ${job.id} created for ${input.cwd}`)
+  return job
+}
+
+/** cron_job 工具的入参（defineTool 按参数 schema 收窄后与此一致）。 */
+interface CronToolArgs {
+  action: 'add' | 'list' | 'update' | 'remove' | 'pause' | 'resume' | 'runs' | 'clear_runs'
+  id?: string
+  cron?: string
+  prompt?: string
+  name?: string
+  cwd?: string
+  enabled?: boolean
+  permissionMode?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  continuous?: boolean
+  newSessionPerRun?: boolean
+  activateOnSuccess?: string
+  model?: { provider?: string; model?: string }
+}
+
+/** 文本输出（output schema: string，render 原样返回）。 */
+function textResult(text: string): string {
+  return text
+}
+
+/** cron-scheduler 插件：调度循环 + cron_job 模型工具。 */
+export const name = 'cron-scheduler'
+export const inject = ['tools', 'timer', 'agents', 'sessions', 'agentPresets', 'agentDefaultModel', 'systemPrompt', 'cronLoopStore', 'sessionPersistence', 'workspaceRegistry']
+
+export function apply(ctx: Context): void {
+  // 加载全局模型池（异步，不阻塞 apply）。
+  void ModelPool.load().then((pool) => { modelPool = pool }).catch((e: unknown) => {
+    ctx.logger?.warn?.(`cron-scheduler: failed to load model pool: ${e instanceof Error ? e.message : String(e)}`)
+  })
+  // 对外暴露 trigger 服务：调用方拿到的 ctx 是 scheduler 自己的 fiber ctx，
+  // 保证 runJob 内读 agents/sessions 等服务时 inject 检查通过。
+  ctx.provide('cronLoopScheduler', {
+    triggerJobNow: (jobId: string) => triggerJobNowOn(ctx, jobId),
+  } satisfies CronLoopScheduler)
+  schedulerApi = ctx.get('cronLoopScheduler') as CronLoopScheduler
+
+  // 调度循环：进程存活期间每 30s 扫描一次；store/agents 等通过惰性 ctx.get 读取。
+  ctx.effect(() => ctx.timer.interval(() => {
+    const store = ctx.get('cronLoopStore')
+    if (store === undefined) return
+    void tick(ctx).catch((error: unknown) => {
+      ctx.logger?.error?.(`cron-scheduler: tick failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }, TICK_MS), 'cron-scheduler.tick')
+
+  ctx.tools.register(defineTool({
+    name: 'cron_job',
+    description: [
+      '管理项目级 cron 定时任务。action:',
+      '- add: 新建任务（prompt 必填；cron 缺省每分钟；cwd 缺省当前项目目录）',
+      '- list: 列出全部任务（id/名称/cron/启用状态/下次触发时间）',
+      '- update: 修改任务（id 必填；cron/prompt/name/enabled 可选）',
+      '- remove: 删除任务及其历史（id 必填）',
+      '- pause / resume: 停用 / 启用任务（id 必填）',
+      '- runs: 查看任务最近执行历史（id 必填）',
+      '- clear_runs: 删除任务执行历史（id 必填；不指定 id 则删除全部历史）',
+      '- 成功后激活另一个任务：add/update 时传 activateOnSuccess（另一个任务 id）；本任务成功后目标立即进入 running 且下次触发时间顺延',
+      '- 固定模型：add/update 时传 model {provider, model}；配了就绕过模型池直接用它，不配走模型池，模型池没配走 DSH 默认',
+    ].join('\n'),
+    parameters: {
+      action: { type: 'string', enum: ['add', 'list', 'update', 'remove', 'pause', 'resume', 'runs', 'clear_runs'], required: true, description: '要执行的动作' },
+      id: { type: 'string', description: '任务 id（add 之外必填）' },
+      cron: { type: 'string', description: '5 段 cron 表达式' },
+      prompt: { type: 'string', description: '任务说明' },
+      name: { type: 'string', description: '展示名' },
+      cwd: { type: 'string', description: '任务归属目录（add 可选；缺省为当前项目目录）' },
+      enabled: { type: 'boolean', description: '启用状态' },
+      permissionMode: { type: 'string', enum: ['read-only', 'workspace-write', 'danger-full-access'], description: '权限模式（缺省 danger-full-access；read-only/workspace-write 会弹审批，不适合无人值守）' },
+      continuous: { type: 'boolean', description: '连续执行（缺省 false；true 时成功后立即续跑下一轮，不等 cron 触发）' },
+      newSessionPerRun: { type: 'boolean', description: '每轮新会话（缺省 false 沿用同一会话）' },
+      activateOnSuccess: { type: 'string', description: '成功后立即激活的另一个任务 id（进入 running，下次触发时间顺延；缺省不激活）' },
+      model: { type: 'object', additionalProperties: false, properties: { provider: { type: 'string', description: 'DSH provider 路由（如 deepseek-official、xai、volcengine）' }, model: { type: 'string', description: '模型 id（如 deepseek-flash、grok-4.7、ark-code-latest）' } }, description: '本任务固定的模型；配了绕过模型池，不配走模型池/DSH 默认' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args: CronToolArgs, exec) {
+      const store = ctx.cronLoopStore
+      // 当前会话的项目目录：任务归属的缺省 cwd。
+      const sessionCwd = exec.agent !== undefined ? exec.agent.session.header.cwd : undefined
+      switch (args.action) {
+        case 'add': {
+          if (args.prompt === undefined || args.prompt === '') throw new Error('cron_job add: prompt is required')
+          // cwd 优先用参数，缺省用当前会话 cwd；两者都必须是真实存在的目录。
+          const rawCwd = args.cwd ?? sessionCwd
+          if (rawCwd === undefined || rawCwd === '') {
+            throw new Error('cron_job add: cwd is required when the current session has no project directory')
+          }
+          const cwd = normalizeCwd(rawCwd)
+          const job = await createJob(ctx, {
+            name: args.name,
+            cwd,
+            cron: args.cron ?? '* * * * *',
+            prompt: args.prompt,
+            permissionMode: args.permissionMode,
+            continuous: args.continuous,
+            newSessionPerRun: args.newSessionPerRun,
+            activateOnSuccess: args.activateOnSuccess,
+            model: args.model,
+          })
+          return textResult(`已创建任务 ${job.id}「${job.name}」\ncron: ${job.cron}\n目录: ${job.cwd}\nprompt: ${job.prompt}`)
+        }
+        case 'list': {
+          const jobs = store.listJobs()
+          if (jobs.length === 0) return textResult('暂无定时任务')
+          const lines = jobs.map((job) => {
+            const next = job.nextRunAt !== undefined ? new Date(job.nextRunAt).toLocaleString() : '—'
+            const stats = job.runStats !== undefined ? ` (${job.runStats.ok}/${job.runStats.total})` : ''
+            return `${job.id} | ${job.enabled ? '✅' : '⏸'} | ${job.cron} | 下次: ${next} | ${job.cwd} | ${job.name}${stats}`
+          })
+          return textResult(['id | 状态 | cron | 下次触发 | 目录 | 名称', ...lines].join('\n'))
+        }
+        case 'update': {
+          if (args.id === undefined) throw new Error('cron_job update: id is required')
+          const job = store.jobs.get(args.id)
+          if (job === undefined) throw new Error(`cron_job update: job ${args.id} not found`)
+          if (args.cron !== undefined) parseCron(args.cron)
+          const next: CronJobRecord = {
+            ...job,
+            cron: args.cron ?? job.cron,
+            prompt: args.prompt ?? job.prompt,
+            name: args.name ?? job.name,
+            enabled: args.enabled ?? job.enabled,
+            continuous: args.continuous ?? job.continuous,
+            newSessionPerRun: args.newSessionPerRun ?? job.newSessionPerRun,
+            activateOnSuccess: args.activateOnSuccess !== undefined ? (args.activateOnSuccess === '' ? undefined : args.activateOnSuccess) : job.activateOnSuccess,
+            model: args.model === undefined ? job.model : normalizeModel(args.model),
+            updatedAt: Date.now(),
+          }
+          await store.putJob(next)
+          return textResult(`已更新 ${job.id}: cron=${next.cron} enabled=${String(next.enabled)} continuous=${String(next.continuous ?? false)} newSessionPerRun=${String(next.newSessionPerRun ?? false)} activateOnSuccess=${String(next.activateOnSuccess ?? '')}`)
+        }
+        case 'remove': {
+          if (args.id === undefined) throw new Error('cron_job remove: id is required')
+          const removed = await store.deleteJobCascade(args.id)
+          if (!removed) throw new Error(`cron_job remove: job ${args.id} not found`)
+          return textResult(`已删除 ${args.id} 及其历史`)
+        }
+        case 'pause': {
+          if (args.id === undefined) throw new Error('cron_job pause: id is required')
+          const job = store.jobs.get(args.id)
+          if (job === undefined) throw new Error(`cron_job pause: job ${args.id} not found`)
+          await store.putJob({ ...job, enabled: false, updatedAt: Date.now() })
+          return textResult(`已暂停 ${args.id}`)
+        }
+        case 'resume': {
+          if (args.id === undefined) throw new Error('cron_job resume: id is required')
+          const job = store.jobs.get(args.id)
+          if (job === undefined) throw new Error(`cron_job resume: job ${args.id} not found`)
+          await store.putJob({ ...job, enabled: true, updatedAt: Date.now() })
+          return textResult(`已恢复 ${args.id}`)
+        }
+        case 'runs': {
+          if (args.id === undefined) throw new Error('cron_job runs: id is required')
+          const runs = store.listRunsByJob(args.id, 10)
+          if (runs.length === 0) return textResult(`${args.id} 暂无执行历史`)
+          const lines = runs.map((run) => {
+            const at = new Date(run.startedAt).toLocaleString()
+            const tail = run.error !== undefined
+              ? ` 错误: ${run.error}`
+              : (run.summary !== undefined ? ` 摘要: ${run.summary.slice(0, 120)}` : '')
+            return `${at} | ${run.status}${tail}`
+          })
+          return textResult(lines.join('\n'))
+        }
+        case 'clear_runs': {
+          if (args.id === undefined || args.id === '') {
+            const count = await store.deleteAllRuns()
+            return textResult(`已删除全部执行历史（${count} 条）`)
+          }
+          const job = store.jobs.get(args.id)
+          if (job === undefined) throw new Error(`cron_job clear_runs: job ${args.id} not found`)
+          const count = await store.deleteRunsByJob(args.id)
+          return textResult(`已删除 ${args.id} 的执行历史（${count} 条）`)
+        }
+      }
+    },
+  }))
+}

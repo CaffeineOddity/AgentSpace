@@ -1,0 +1,101 @@
+// model-pool 冒烟测试：tsx --test 运行。
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { ModelPool, computeRecoveryAt } from './model-pool.ts'
+import type { ModelEntry, ModelPoolFile } from './model-pool.ts'
+
+/** 测试用隔离落盘路径：写临时目录，绝不污染真实 ~/.dsh。 */
+function testPath(): string {
+  return join(tmpdir(), `dsh-model-pool-test-${randomUUID()}.json`)
+}
+
+/** 构造测试用 pool（绕过文件读取；落盘指向隔离临时路径）。 */
+function makePool(models: ModelEntry[], enabled = true): ModelPool {
+  return ModelPool.fromConfig({ enabled, models }, testPath())
+}
+
+test('pickAvailable returns highest priority non-exhausted model', () => {
+  const pool = makePool([
+    { id: 'b', provider: 'p2', model: 'm2', priority: 2, quotaReset: { type: 'hours', value: 24 } },
+    { id: 'a', provider: 'p1', model: 'm1', priority: 1, quotaReset: { type: 'hours', value: 24 } },
+  ])
+  const picked = pool.pickAvailable()
+  assert.equal(picked?.id, 'a')
+  assert.equal(picked?.provider, 'p1')
+})
+
+test('pickAvailable skips exhausted models', () => {
+  const pool = makePool([
+    { id: 'a', provider: 'p1', model: 'm1', priority: 1, quotaReset: { type: 'hours', value: 24 }, exhausted: true, exhaustedAt: Date.now() },
+    { id: 'b', provider: 'p2', model: 'm2', priority: 2, quotaReset: { type: 'hours', value: 24 } },
+  ])
+  const picked = pool.pickAvailable()
+  assert.equal(picked?.id, 'b')
+})
+
+test('pickAvailable returns null when all exhausted', () => {
+  const pool = makePool([
+    { id: 'a', provider: 'p1', model: 'm1', priority: 1, quotaReset: { type: 'hours', value: 24 }, exhausted: true, exhaustedAt: Date.now() },
+    { id: 'b', provider: 'p2', model: 'm2', priority: 2, quotaReset: { type: 'hours', value: 24 }, exhausted: true, exhaustedAt: Date.now() },
+  ])
+  assert.equal(pool.pickAvailable(), null)
+})
+
+test('pickAvailable recovers exhausted model after reset period', () => {
+  const past = Date.now() - 25 * 3_600_000 // 25 小时前
+  const pool = makePool([
+    { id: 'a', provider: 'p1', model: 'm1', priority: 1, quotaReset: { type: 'hours', value: 24 }, exhausted: true, exhaustedAt: past },
+  ])
+  // 此处会触发 save()，但落盘指向隔离临时路径，不污染真实 ~/.dsh
+  pool.pickAvailable()
+  const snapshot = pool.snapshot()
+  assert.equal(snapshot?.models[0]?.exhausted, false)
+})
+
+test('pickAvailable skips permanentlyUnavailable models', () => {
+  const pool = makePool([
+    { id: 'a', provider: 'p1', model: 'm1', priority: 1, quotaReset: { type: 'hours', value: 24 }, permanentlyUnavailable: true },
+    { id: 'b', provider: 'p2', model: 'm2', priority: 2, quotaReset: { type: 'hours', value: 24 } },
+  ])
+  const picked = pool.pickAvailable()
+  assert.equal(picked?.id, 'b')
+})
+
+test('computeRecoveryAt hours type', () => {
+  const entry: ModelEntry = {
+    id: 'a', provider: 'p', model: 'm', priority: 1,
+    quotaReset: { type: 'hours', value: 12 },
+    exhaustedAt: 1000000,
+  }
+  assert.equal(computeRecoveryAt(entry), 1000000 + 12 * 3_600_000)
+})
+
+test('computeRecoveryAt returns null when not exhausted', () => {
+  const entry: ModelEntry = {
+    id: 'a', provider: 'p', model: 'm', priority: 1,
+    quotaReset: { type: 'hours', value: 24 },
+  }
+  assert.equal(computeRecoveryAt(entry), null)
+})
+
+test('disabled pool returns null', () => {
+  const pool = makePool([], false)
+  assert.equal(pool.pickAvailable(), null)
+})
+
+test('enabled pool with empty models is treated as not configured', () => {
+  // UI 允许保存 {enabled: true, models: []}：应视为未配置（isEnabled=false），
+  // 任务走 dsh 自身模型流程，而不是「all models exhausted」。
+  const pool = ModelPool.fromConfig({ enabled: true, models: [] }, testPath())
+  assert.equal(pool.isEnabled, false)
+  assert.equal(pool.pickAvailable(), null)
+})
+
+test('isEnabled tolerates missing models key from hand-edited file', () => {
+  const pool = ModelPool.fromConfig({ enabled: true } as unknown as ModelPoolFile, testPath())
+  assert.equal(pool.isEnabled, false)
+  assert.equal(pool.pickAvailable(), null)
+})

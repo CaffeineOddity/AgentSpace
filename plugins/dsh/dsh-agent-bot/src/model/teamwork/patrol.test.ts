@@ -1,0 +1,790 @@
+/**
+ * 巡检器单测：状态机判定 + **真跑一轮**（tickOnce）覆盖叫醒链。
+ * 假 host：只实现 ensureAgent / agents().get / deliver，不拉真 agent。
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { resetConfigCache } from '../config.js'
+import { getAgent as getAgentConfig, saveAgent, touchSession } from '../agents.js'
+import { readTask, writeTask, type TaskBoard, type Assignee } from './task-board.js'
+import { bindSession, boundTaskId, resetBindingsCache } from './binding.js'
+import { createPatrol } from './patrol.js'
+import { resetWriteFence } from './relay.js'
+import type { AgentLike } from '../runtime.js'
+
+let dir: string
+let prevEnv: string | undefined
+
+function mkAgent(name: string, slots: Array<{ key: string; sessionId: string }> = [], sessionBySender = false): string {
+  const wrote = saveAgent({
+    id: '',
+    name,
+    description: '',
+    workspace: join(dir, name),
+    prompt: '',
+    prompt_placement: 'system',
+    skill_groups: [],
+    prompt_append_skills: false,
+    reuse_session: true,
+    session_by_sender: sessionBySender,
+    permission_mode: 'danger-full-access',
+    session_timeout_minutes: 30,
+    concurrency: 'serial',
+    needs_target_workspace: false,
+  })
+  for (const s of slots) touchSession(wrote.agent.id, s.key, s.sessionId, 1, '')
+  return wrote.agent.id
+}
+
+function task(over: Partial<TaskBoard> = {}): TaskBoard {
+  return {
+    taskId: 'task_t1',
+    taskLead: 'lead',
+    leadName: 'Lead',
+    sender: 'alice',
+    providerId: 'demo',
+    sessionParts: { bot_id: 'b1', group_id: 'g1' },
+    originContext: '原始',
+    access: 'write',
+    target: '/tmp/proj',
+    createdAt: Date.now(),
+    deadlineAt: Date.now() + 60_000,
+    groupSnapshot: [{ agentId: 'lead', name: 'Lead', description: '' }],
+    assignees: [],
+    body: '# 海报\n',
+    ...over,
+  }
+}
+
+function assignee(over: Partial<Assignee> = {}): Assignee {
+  return {
+    expertId: 'e1',
+    expertName: 'E',
+    dispatchedBy: 'lead',
+    dispatchedByName: 'Lead',
+    sessionId: 's',
+    access: 'write',
+    status: 'running',
+    wake: true,
+    ...over,
+  }
+}
+
+/**
+ * 假 host：记录 followup 到的 sessionId；agents().get 只看注册过的 id。
+ * 回合生命周期要真实：`followup` 会**把会话变成 running**，跑完（默认下一个宏任务，
+ * 或 idleAfterFollowupMs 毫秒后）回到 idle —— 否则"Is this turn started?" 这类判断测不出来。
+ * `busy` 里的会话表示"一直在跑"，whenIdle 永不 resolve（用来测顺延/等锁）。
+ * `noopFollowup` 里的会话表示"叫了也不开跑"（用来测"还没开始就别当它做完了"）。
+ */
+function fakeHost(
+  live: string[],
+  delivered: Array<{ providerId: string; text: string[] }> = [],
+  eventsBySession: Record<string, Array<{ seq: number; type: string; data?: unknown }>> = {},
+  busy: string[] = [],
+  onFollowup?: (sessionId: string) => void,
+  cancelled: string[] = [],
+  opts: { idleAfterFollowupMs?: number; noopFollowup?: string[] } = {},
+) {
+  const woken: Array<{ sessionId: string; text: string }> = []
+  const turning = new Set<string>() // followup 开了这一轮（跑完会回 idle）
+  const host = {
+    async ensureAgent(input: { sessionId: string }): Promise<AgentLike> {
+      if (!live.includes(input.sessionId)) live.push(input.sessionId)
+      return {} as AgentLike
+    },
+    agents: () => ({
+      get: (sessionId: string) => {
+        if (!live.includes(sessionId)) return undefined
+        const perma = busy.includes(sessionId)
+        return {
+          get status(): 'idle' | 'running' {
+            return perma || turning.has(sessionId) ? 'running' : 'idle'
+          },
+          cancel: () => { cancelled.push(sessionId) },
+          whenIdle: () =>
+            new Promise<void>((resolve) => {
+              if (perma) return // 一直忙：永不 resolve
+              if (!turning.has(sessionId)) return resolve()
+              setTimeout(() => {
+                turning.delete(sessionId)
+                resolve()
+              }, opts.idleAfterFollowupMs ?? 0)
+            }),
+          followup: (msg: { content: Array<{ text: string }> }) => {
+            woken.push({ sessionId, text: msg.content[0]?.text ?? '' })
+            onFollowup?.(sessionId)
+            if (!(opts.noopFollowup ?? []).includes(sessionId)) turning.add(sessionId)
+          },
+          session: { seq: 0, snapshotEvents: () => eventsBySession[sessionId] ?? [] },
+        } as unknown as AgentLike
+      },
+    }),
+    async deliver(providerId: string, _sessionParts: Record<string, string>, messages: Array<{ text: string }>) {
+      delivered.push({ providerId, text: messages.map((m) => m.text) })
+    },
+  }
+  return { host, woken, delivered }
+}
+
+function loadAgent(id: string) {
+  const cfg = getAgentConfig(id)
+  if (cfg === undefined) throw new Error(`agent ${id} 未落盘`)
+  return cfg
+}
+
+beforeEach(() => {
+  prevEnv = process.env.AGENT_BOT_CONFIG_DIR
+  dir = mkdtempSync(join(tmpdir(), 'patrol-test-'))
+  process.env.AGENT_BOT_CONFIG_DIR = dir
+  resetConfigCache()
+  resetBindingsCache()
+  resetWriteFence()
+})
+
+afterEach(() => {
+  resetConfigCache()
+  resetBindingsCache()
+  resetWriteFence()
+  if (prevEnv === undefined) delete process.env.AGENT_BOT_CONFIG_DIR
+  else process.env.AGENT_BOT_CONFIG_DIR = prevEnv
+  rmSync(dir, { recursive: true, force: true })
+})
+
+describe('tickOnce 叫醒链（A→B→C）', () => {
+  it('C 完成 → 叫醒 B（用 B 的协作会话）；本级未齐不叫 A', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const c = mkAgent('C', [{ key: 'task:task_t1:C', sessionId: 'sess-c' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [
+        assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true }),
+        assignee({ expertId: c, expertName: 'C', dispatchedBy: b, sessionId: 'sess-c', status: 'idle', wake: true }),
+      ],
+    }))
+    const { host, woken } = fakeHost(['sess-a', 'sess-b', 'sess-c'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+
+    // B 的下游 C 已终态 → 叫醒 B；A 不该被叫（B 自己还没做综合）
+    expect(woken.map((w) => w.sessionId)).toEqual(['sess-b'])
+    expect(woken[0]?.text).toContain('C 已完成')
+  })
+
+  it('B 派完 C 但 C 还在跑 → 谁都不叫（不提前叫醒 A）', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const c = mkAgent('C', [{ key: 'task:task_t1:C', sessionId: 'sess-c' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [
+        assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true }),
+        assignee({ expertId: c, expertName: 'C', dispatchedBy: b, sessionId: 'sess-c', status: 'running', wake: true }),
+      ],
+    }))
+    const { host, woken } = fakeHost(['sess-a', 'sess-b', 'sess-c'], [], {}, ['sess-c'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    expect(woken).toEqual([])
+  })
+
+  it('全终态 → 叫醒 taskLead 综合；同状态再跑不重复叫', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true })],
+    }))
+    const { host, woken } = fakeHost(['sess-a', 'sess-b'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    await patrol.tickOnce()
+    await patrol.tickOnce()
+    expect(woken.map((w) => w.sessionId)).toEqual(['sess-a']) // 只叫一次
+  })
+
+  it('待决 → 叫醒 taskLead 拍板，也只叫一次', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      pendingHuman: { questions: ['要哪个尺寸？'], askedBy: 'B', askedAt: 7 },
+    }))
+    const { host, woken } = fakeHost(['sess-a'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    await patrol.tickOnce()
+    expect(woken.map((w) => w.sessionId)).toEqual(['sess-a'])
+  })
+
+  it('没有待决时，过期 deadline 不收口、不发进度', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const past = Date.now() - 1
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      deadlineAt: past,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'running', wake: true })],
+    }))
+    const { host, delivered } = fakeHost(['sess-a', 'sess-b'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    expect(delivered).toHaveLength(0)
+    expect(readTask('running', 'task_t1')?.deadlineAt).toBe(past)
+  })
+
+  it('问卷到点先提醒并再延一个周期；已提醒再到点则关单', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const past = Date.now() - 1
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      deadlineAt: past,
+      pendingHuman: { questions: ['要哪个尺寸？'], askedBy: a, askedAt: 9, toHuman: true },
+    }))
+    const { host, delivered } = fakeHost(['sess-a'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    expect(delivered[0]?.text[0]).toContain('还没人回')
+    const reminded = readTask('running', 'task_t1')!
+    expect(reminded.pendingHuman?.reminded).toBe(true)
+    expect(reminded.deadlineAt).toBeGreaterThan(Date.now() + 6 * 86_400_000)
+    writeTask('running', { ...reminded, deadlineAt: Date.now() - 1 })
+    await patrol.tickOnce()
+    expect(delivered.some((d) => d.text[0]?.includes('已关闭'))).toBe(true)
+    expect(readTask('done', 'task_t1')).toBeDefined()
+  })
+
+  it('全终态 → 收口：叫醒 lead、取它这轮产出交付、移 done/ 并解绑', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    bindSession('sess-b', 'task_t1')
+    bindSession('sess-a', 'task_t1')
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true })],
+    }))
+    const { host, delivered } = fakeHost(['sess-a', 'sess-b'], [], {
+      'sess-a': [
+        { seq: 1, type: 'turn/start' },
+        { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '海报已出好，见附件' }] } } },
+      ],
+    })
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    await patrol.flush()
+    expect(delivered[0]?.text[0]).toContain('海报已出好')
+    expect(readTask('running', 'task_t1')).toBeUndefined()
+    expect(readTask('done', 'task_t1')).toBeDefined()
+    expect(boundTaskId('sess-b')).toBeUndefined()
+  })
+
+  it('中间层在等下游（waiting）→ 下游终态后恢复 running 并叫醒它，不叫 A', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const c = mkAgent('C', [{ key: 'task:task_t1:C', sessionId: 'sess-c' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [
+        assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'waiting', wake: true }),
+        assignee({ expertId: c, expertName: 'C', dispatchedBy: b, sessionId: 'sess-c', status: 'idle', wake: true }),
+      ],
+    }))
+    const { host, woken } = fakeHost(['sess-a', 'sess-b', 'sess-c'], [], {}, ['sess-b'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    expect(woken.map((w) => w.sessionId)).toEqual(['sess-b'])
+    const back = readTask('running', 'task_t1')
+    expect(back?.assignees.find((x) => x.expertId === b)?.status).toBe('running') // 恢复了
+  })
+
+  it('事件快路径：会话变 idle 立刻转态并上报（不等轮询）', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'running', wake: true })],
+    }))
+    // A 有自己的通道会话；B 的协作会话在跑（busy）→ 模拟「只有 B 做完」这一事件
+    const { host, woken } = fakeHost(['sess-a', 'sess-b'], [], {}, [])
+    const patrol = createPatrol(host)
+    await patrol.reconcile('sess-b')
+    // B 被转成 idle 并上报给 A（A 的通道会话被叫醒）
+    const back = readTask('running', 'task_t1')
+    expect(back?.assignees.find((x) => x.expertId === b)?.status).toBe('idle')
+    expect(woken.map((w) => w.sessionId)).toContain('sess-a')
+  })
+
+  it('问卷定时器到点提醒，专家做完不等巡检间隔', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      deadlineAt: Date.now() - 1,
+      pendingHuman: { questions: ['要哪个尺寸？'], askedBy: a, askedAt: 9, toHuman: true },
+    }))
+    const { host, delivered } = fakeHost(['sess-a'])
+    const patrol = createPatrol(host)
+    await patrol.start()
+    await new Promise((r) => setTimeout(r, 30))
+    expect(delivered[0]?.text[0]).toContain('还没人回')
+    patrol.stop()
+  })
+
+  it('给人发的问卷（toHuman）→ deliver 问题，墙钟改成发出时刻 + 问卷天数', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      deadlineAt: 0,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: false })],
+      pendingHuman: { questions: ['要哪个尺寸？'], askedBy: a, askedAt: 123, toHuman: true },
+    }))
+    const { host, delivered } = fakeHost(['sess-a', 'sess-b'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    expect(delivered[0]?.text[0]).toContain('要哪个尺寸？')
+    expect(delivered[0]?.text[0]).toContain('@Lead')      // 问卷 @ 的是**名字**，不是 agent id
+    const back = readTask('running', 'task_t1')!
+    expect(back.deadlineAt - Date.now()).toBeGreaterThan(6 * 86_400_000)
+    // 同一 askedAt 不重复发
+    await patrol.tickOnce()
+    expect(delivered).toHaveLength(1)
+  })
+
+  it('上抛给 lead 的待决：lead 答完后自动清掉（不靠模型记得 clear_pending）', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: false })],
+      pendingHuman: { questions: ['用哪个字体？'], askedBy: b, askedAt: 555 },
+    }))
+    const { host, woken } = fakeHost(['sess-a', 'sess-b'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    await patrol.flush() // 等「叫醒 lead → 等它答完 → 清待决」这个后台 job
+    expect(woken.map((w) => w.sessionId)).toContain('sess-a') // 叫醒了 lead
+    expect(readTask('running', 'task_t1')?.pendingHuman).toBeUndefined() // 自动清掉
+  })
+
+  it('lead 这轮又问了新问题（askedAt 变了）→ 保留新的待决', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: false })],
+      pendingHuman: { questions: ['用哪个字体？'], askedBy: b, askedAt: 555 },
+    }))
+    // lead 那轮里改成新问题（模拟 ask_human 写了新的 askedAt）
+    const { host } = fakeHost(['sess-a', 'sess-b'], [], {
+      'sess-a': [{ seq: 1, type: 'turn/start' }],
+    }, [], () => {
+      const t = readTask('running', 'task_t1')!
+      t.pendingHuman = { questions: ['要哪个尺寸？'], askedBy: a, askedAt: 999, toHuman: true }
+      writeTask('running', t)
+    })
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    await patrol.flush()
+    expect(readTask('running', 'task_t1')?.pendingHuman?.askedAt).toBe(999) // 新的还在
+  })
+
+  it('专家卡在等审批 → 标 need_decision + 通知人（只发一次）；批准后回到 running', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const bEvents: Array<{ seq: number; type: string; data?: unknown }> = [
+      { seq: 1, type: 'turn/start' },
+      { seq: 2, type: 'approval/asked', data: { id: 'ap1', toolName: 'write_file', reason: '要写工作区外文件' } },
+    ]
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'running', wake: true })],
+    }))
+    const { host, delivered } = fakeHost(['sess-a', 'sess-b'], [], { 'sess-b': bEvents }, ['sess-b'])
+    const patrol = createPatrol(host)
+
+    await patrol.tickOnce()
+    expect(readTask('running', 'task_t1')?.assignees[0]?.status).toBe('need_decision')
+    expect(delivered[0]?.text[0]).toContain('等你批准')
+    expect(delivered[0]?.text[0]).toContain('write_file')
+
+    await patrol.tickOnce() // 仍卡着 → 不重复通知
+    expect(delivered).toHaveLength(1)
+
+    // 人批准了 → 会话日志出现配对的 decided → 回到 running
+    bEvents.push({ seq: 3, type: 'approval/decided', data: { id: 'ap1', outcome: 'allowed-once' } })
+    await patrol.tickOnce()
+    expect(readTask('running', 'task_t1')?.assignees[0]?.status).toBe('running')
+  })
+
+  it('没有待决时，过期 deadline 不因为等审批而关单', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      deadlineAt: Date.now() - 1,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'need_decision', wake: true })],
+    }))
+    const { host, delivered } = fakeHost(['sess-a', 'sess-b'], [], {}, ['sess-b'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    expect(delivered.some((d) => d.text[0]?.includes('已关闭'))).toBe(false)
+    expect(readTask('running', 'task_t1')).toBeDefined()
+  })
+
+  it('IM 任务里专家调了 ask_user_question → 取消那轮、写待决、发问卷到群', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const bEvents = [
+      { seq: 1, type: 'turn/start' },
+      {
+        seq: 2,
+        type: 'tool/call',
+        data: { callId: 'c1', name: 'ask_user_question', arguments: JSON.stringify({ questions: [{ id: 'q1', question: '要哪个尺寸？' }] }) },
+      },
+    ]
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      providerId: 'demo', // IM
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'running', wake: true })],
+    }))
+    const cancelled: string[] = []
+    const { host, delivered } = fakeHost(['sess-a', 'sess-b'], [], { 'sess-b': bEvents }, ['sess-b'], undefined, cancelled)
+    const patrol = createPatrol(host, { askHandoffGraceMs: 1 })
+    await patrol.tickOnce()
+    await new Promise((r) => setTimeout(r, 20))
+    expect(cancelled).toEqual(['sess-b'])                       // 取消了那轮
+    const back = readTask('running', 'task_t1')!
+    expect(back.assignees[0]?.status).toBe('need_decision')      // 标记在等人
+    expect(back.pendingHuman?.toHuman).toBe(true)
+    expect(back.pendingHuman?.questions).toEqual(['要哪个尺寸？'])
+    expect(delivered[0]?.text[0]).toContain('要哪个尺寸？')      // 问卷发到群
+    expect(back.deadlineAt).toBeGreaterThan(Date.now())          // 顺延墙钟
+  })
+
+  it('local（Web）任务里调 ask_user_question → 不接管，留给网页 answerer', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const bEvents = [
+      { seq: 1, type: 'tool/call', data: { callId: 'c1', name: 'ask_user_question', arguments: '{"questions":[{"id":"q1","question":"?"}]}' } },
+    ]
+    writeTask('running', task({
+      taskId: 'task_t1', taskLead: a, providerId: 'local',
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'running', wake: true })],
+    }))
+    const cancelled: string[] = []
+    const { host, delivered } = fakeHost(['sess-a', 'sess-b'], [], { 'sess-b': bEvents }, ['sess-b'], undefined, cancelled)
+    const patrol = createPatrol(host, { askHandoffGraceMs: 1 })
+    await patrol.tickOnce()
+    await new Promise((r) => setTimeout(r, 20))
+    expect(cancelled).toEqual([])
+    expect(delivered).toHaveLength(0)
+    expect(readTask('running', 'task_t1')?.pendingHuman).toBeUndefined()
+  })
+
+  it('同 target 的 write 队列：前一个 idle → 释放锁并叫醒排队中的下一个', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const c = mkAgent('C', [{ key: 'task:task_t1:C', sessionId: 'sess-c' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      target: '/proj',
+      assignees: [
+        // B 是同一 target 上正在跑的 write（占着锁）
+        assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'running', access: 'write', target: '/proj' }),
+        // C 排在同一 target 的队列里（还没被启动）
+        assignee({ expertId: c, expertName: 'C', dispatchedBy: a, sessionId: 'sess-c', status: 'waiting', access: 'write', target: '/proj', instruction: '做海报', wake: false }),
+      ],
+    }))
+    // 手动占锁（模拟 dispatch 时 begin 过），并让 B 的会话已 idle
+    const { getWriteFence } = await import('./relay.js')
+    getWriteFence(() => undefined).begin('/proj', 'sess-b')
+    const started: string[] = []
+    const { host } = fakeHost(['sess-a', 'sess-b', 'sess-c'], [], {}, [], undefined, started)
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    const back = readTask('running', 'task_t1')!
+    expect(back.assignees.find((x) => x.expertId === b)?.status).toBe('idle')
+    // 锁让出来了，C 被启动
+    expect(back.assignees.find((x) => x.expertId === c)?.status).toBe('running')
+    expect(back.assignees.find((x) => x.expertId === c)?.wake).toBe(true)
+  })
+
+  it('read 不占锁：同 target 有 write 在跑时，read 照样跑', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const c = mkAgent('C', [{ key: 'task:task_t1:C', sessionId: 'sess-c' }])
+    const { getWriteFence } = await import('./relay.js')
+    const { host } = fakeHost(['sess-a', 'sess-b', 'sess-c'])
+    // 必须先建 host：栅栏的"活性"靠 agents().get，占位会话不在线会被当作已死回收
+    const fence = getWriteFence(host.agents)
+    fence.begin('/proj', 'sess-b')
+    expect(fence.occupied('/proj')).toBe(true)
+    expect(fence.occupied('/proj/design')).toBe(true)   // 子目录也算冲突
+    expect(fence.occupied('/other')).toBe(false)
+    void b
+    void c
+  })
+
+  it('巡检不拿旧快照覆盖：叫醒上游期间别人写进 md 的正文要保住', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const c = mkAgent('C', [{ key: 'task:task_t1:C', sessionId: 'sess-c' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      body: '初稿',
+      assignees: [
+        // B 刚干完（idle）→ 会触发「叫醒上游 A」；C 还在跑 → 不走收口
+        assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true }),
+        assignee({ expertId: c, expertName: 'C', dispatchedBy: a, sessionId: 'sess-c', status: 'running', wake: true }),
+      ],
+    }))
+    // 叫醒 A 的那一刻（await 期间），别人往同一份 md 写了正文（模拟专家 update_task）
+    const { host } = fakeHost(['sess-a', 'sess-b', 'sess-c'], [], {}, ['sess-c'], () => {
+      const t = readTask('running', 'task_t1')!
+      t.body = '初稿\n\n- 专家补的进展'
+      writeTask('running', t)
+    })
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    const back = readTask('running', 'task_t1')
+    expect(back?.body).toContain('专家补的进展')      // 正文没被旧快照覆盖
+    expect(back?.assignees.find((x) => x.expertId === b)?.wake).toBe(false) // 但 wake 消费照常落盘
+  })
+
+  it('锁被占时：等下游的中间层不被唤醒（否则两个 write 同写一个目录）', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const c = mkAgent('C', [{ key: 'task:task_t1:C', sessionId: 'sess-c' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      target: '/proj',
+      assignees: [
+        assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'waiting', access: 'write', target: '/proj' }),
+        assignee({ expertId: c, expertName: 'C', dispatchedBy: b, sessionId: 'sess-c', status: 'idle', wake: true }),
+      ],
+    }))
+    const { getWriteFence } = await import('./relay.js')
+    const { host, woken } = fakeHost(['sess-a', 'sess-b', 'sess-c', 'sess-other'])
+    const fence = getWriteFence(host.agents)
+    fence.begin('/proj', 'sess-other') // 别人占着这个目标
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    expect(woken).toEqual([]) // B 不唤醒（在等锁），A 也不被上报
+    expect(readTask('running', 'task_t1')?.assignees.find((x) => x.expertId === b)?.status).toBe('waiting')
+  })
+
+  it('锁让出来后：等下游的中间层被唤醒并重新占锁', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    const c = mkAgent('C', [{ key: 'task:task_t1:C', sessionId: 'sess-c' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      target: '/proj',
+      assignees: [
+        assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'waiting', access: 'write', target: '/proj' }),
+        assignee({ expertId: c, expertName: 'C', dispatchedBy: b, sessionId: 'sess-c', status: 'idle', wake: true }),
+      ],
+    }))
+    const { getWriteFence } = await import('./relay.js')
+    const { host, woken } = fakeHost(['sess-a', 'sess-b', 'sess-c'], [], {}, ['sess-b'])
+    const fence = getWriteFence(host.agents) // 锁是空的
+    expect(fence.occupied('/proj')).toBe(false)
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    expect(woken.map((w) => w.sessionId)).toEqual(['sess-b']) // 叫醒 B 继续做
+    const back = readTask('running', 'task_t1')!
+    expect(back.assignees.find((x) => x.expertId === b)?.status).toBe('running')
+    expect(fence.occupied('/proj')).toBe(true) // 重新占住
+  })
+
+  it('慢综合也能交付（收口不再设人为窗口）', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true })],
+    }))
+    const events = { 'sess-a': [{ seq: 0, type: 'turn/start' }, { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '海报已出好' }] } } }] }
+    const { host, delivered } = fakeHost(['sess-a', 'sess-b'], [], events, [], undefined, [], { idleAfterFollowupMs: 20 })
+    const patrol = createPatrol(host) // 窗口设很小也不影响：收口等的是"它真的跑完"
+    await patrol.tickOnce()
+    await patrol.flush()
+    expect(delivered[0]?.text[0]).toContain('海报已出好')
+    expect(readTask('done', 'task_t1')).toBeDefined()
+  })
+
+  it('叫醒了但还没开跑（仍 idle 且无新事件）→ 不交付空文本、不移 done', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true })],
+    }))
+    const { host, delivered } = fakeHost(['sess-a', 'sess-b'], [], {}, [], undefined, [], { noopFollowup: ['sess-a'] })
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    await patrol.flush()
+    expect(delivered).toHaveLength(0)                    // 没发「（综合无输出）」这种假答案
+    expect(readTask('running', 'task_t1')).toBeDefined() // 也没移 done
+    expect(readTask('done', 'task_t1')).toBeUndefined()
+  })
+
+  it('deliver 失败 → 不移 done/，留在 running/ 等重试', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true })],
+    }))
+    const events = { 'sess-a': [{ seq: 0, type: 'turn/start' }, { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '结果' }] } } }] }
+    const { host } = fakeHost(['sess-a', 'sess-b'], [], events)
+    // 让 deliver 抛错
+    host.deliver = async () => { throw new Error('通道挂了') }
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    await patrol.flush()
+    expect(readTask('running', 'task_t1')).toBeDefined()  // 没被移走
+    expect(readTask('done', 'task_t1')).toBeUndefined()
+  })
+
+  it('投递连续失败到上限 → 文本落进 md 正文并停止重投（消息不丢、不空转）', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      body: '初稿',
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true })],
+    }))
+    const events = { 'sess-a': [{ seq: 0, type: 'turn/start' }, { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '最终结论' }] } } }] }
+    const { host } = fakeHost(['sess-a', 'sess-b'], [], events)
+    host.deliver = async () => { throw new Error('通道挂了') }
+    const patrol = createPatrol(host, { deliverMaxAttempts: 2 })
+    await patrol.tickOnce()
+    await patrol.flush()
+    await patrol.tickOnce()   // 第 2 次失败 → 到上限
+    await patrol.flush()
+    const back = readTask('running', 'task_t1')
+    expect(back?.body).toContain('最终结论')          // 落进正文，消息不丢
+    expect(back?.body).toContain('未能发到群')
+    expect(readTask('done', 'task_t1')).toBeUndefined() // 仍留在 running/
+  })
+
+  it('任务被人挪走（cancel/）→ 解绑清理把会话解掉', async () => {
+    mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    bindSession('sess-a', 'task_t1')
+    // running/ 里没有这份任务（相当于人已 mv 到 cancel/）
+    const { host } = fakeHost(['sess-a'])
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    expect(boundTaskId('sess-a')).toBeUndefined()
+  })
+
+  it('专家会话销毁 → 问人，不按次数判 failed', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    bindSession('sess-a', 'task_t1')
+    bindSession('sess-b', 'task_t1')
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'running', wake: true })],
+    }))
+    const events = { 'sess-a': [{ seq: 1, type: 'turn/start' }, { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'B 失败了，我来收口' }] } } }] }
+    const { host, woken, delivered } = fakeHost(['sess-a', 'sess-b'], [], events)
+    const patrol = createPatrol(host)
+    await patrol.handleDisposed('sess-b')
+    await patrol.handleDisposed('sess-b')
+    const back = readTask('running', 'task_t1')
+    expect(back?.assignees[0]?.status).toBe('need_decision')
+    expect(back?.pendingHuman?.kind).toBe('interrupt')
+    expect(delivered.some((d) => d.text[0]?.includes('会话没了'))).toBe(true)
+    expect(woken).toHaveLength(0)
+    expect(readTask('done', 'task_t1')).toBeUndefined()
+  })
+
+  it('专家会话缺失（漏掉 disposed 事件）→ 问人，不判 failed', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    bindSession('sess-a', 'task_t1')
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'running', wake: true })],
+    }))
+    const events = { 'sess-a': [{ seq: 1, type: 'turn/start' }, { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'B 失败了，我来收口' }] } } }] }
+    const { host, delivered } = fakeHost(['sess-a'], [], events)
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    const back = readTask('running', 'task_t1')
+    expect(back?.assignees[0]?.status).toBe('need_decision')
+    expect(back?.pendingHuman?.questions[0]).toContain('会话没了')
+    expect(delivered.some((d) => d.text[0]?.includes('会话没了'))).toBe(true)
+    expect(readTask('done', 'task_t1')).toBeUndefined()
+  })
+
+  it('lead 会话不在线（重启/被回收）→ 重建后仍能叫醒综合并交付', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    bindSession('sess-a', 'task_t1')
+    bindSession('sess-b', 'task_t1')
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'idle', wake: true })],
+    }))
+    const events = { 'sess-a': [{ seq: 1, type: 'turn/start' }, { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '海报已出好' }] } } }] }
+    // lead 的通道会话 sess-a 不在 live（模拟进程重启后全丢）；B 已 idle → 全终态综合
+    const { host, woken, delivered } = fakeHost(['sess-b'], [], events)
+    const patrol = createPatrol(host)
+    await patrol.tickOnce()
+    await patrol.flush()
+    expect(woken.map((w) => w.sessionId)).toContain('sess-a') // 重建并叫醒 lead
+    expect(delivered.some((d) => d.text[0]?.includes('海报已出好'))).toBe(true)
+    expect(readTask('done', 'task_t1')).toBeDefined()
+  })
+
+  it('need_decision（等审批）会话被回收 → 直接判 failed 并上报', async () => {
+    const a = mkAgent('A', [{ key: 'demo_b1_g1', sessionId: 'sess-a' }])
+    const b = mkAgent('B', [{ key: 'task:task_t1:B', sessionId: 'sess-b' }])
+    bindSession('sess-a', 'task_t1')
+    bindSession('sess-b', 'task_t1')
+    writeTask('running', task({
+      taskId: 'task_t1',
+      taskLead: a,
+      assignees: [assignee({ expertId: b, expertName: 'B', dispatchedBy: a, sessionId: 'sess-b', status: 'need_decision', wake: true })],
+    }))
+    const events = { 'sess-a': [{ seq: 1, type: 'turn/start' }, { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'B 卡在审批，收口' }] } } }] }
+    const { host, woken } = fakeHost(['sess-a', 'sess-b'], [], events)
+    const patrol = createPatrol(host)
+    await patrol.handleDisposed('sess-b')
+    await patrol.flush()
+    expect(readTask('done', 'task_t1')?.assignees[0]?.status).toBe('failed')
+    expect(woken.map((w) => w.sessionId)).toContain('sess-a')
+  })
+})

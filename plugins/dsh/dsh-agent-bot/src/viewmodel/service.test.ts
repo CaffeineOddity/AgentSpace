@@ -1,0 +1,1002 @@
+/**
+ * agentBot 门面：listAgents / getAgent / registerProvider / ask（含 H5：未知 agent、按人、空回复、pending reject）。
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { getAgent } from '../model/agents.js'
+import { resetConfigCache, saveConfig } from '../model/config.js'
+import type { AgentLike, AgentsService, HostServices } from '../model/runtime.js'
+import { createAgentBotService, emptyHostServices } from './service.js'
+import { resetBindingsCache } from '../model/teamwork/binding.js'
+import { inboundFor, resetInboundCache } from '../model/teamwork/inbound.js'
+
+function fakeHost(
+  events: Array<{ seq: number; type: string; data?: unknown }>,
+  whenIdle: () => Promise<void>,
+  record?: { followups: unknown[] },
+): HostServices {
+  const live = new Map<string, AgentLike>()
+  const agents: AgentsService = {
+    get(id) {
+      return live.get(id)
+    },
+    async create(options) {
+      const agent: AgentLike = {
+        session: {
+          seq: 0,
+          snapshotEvents: () => events,
+          append() {
+            return
+          },
+        },
+        followup(input) {
+          record?.followups.push(input)
+        },
+        whenIdle,
+      }
+      live.set(String(options.sessionId), agent)
+      return {
+        agent,
+        async dispose() {
+          return
+        },
+      }
+    },
+    async resume() {
+      throw new Error('test: unexpected resume')
+    },
+  }
+  return {
+    agents: () => agents,
+    agentDefaultModel: () => ({ currentSelection: () => ({ provider: 'p', model: 'm' }) }),
+    agentPresets: () => ({
+      async mount() {
+        return
+      },
+    }),
+    sessionPersistence: () => ({
+      async list() {
+        return []
+      },
+    }),
+    sessions: () => undefined,
+    workspaceRegistry: () => undefined,
+  }
+}
+
+/** listProviders 的 id/label 投影（能力字段是可选的，不参与这些断言）。 */
+function summary(svc: { listProviders(): Array<{ id: string; label: string }> }): Array<{ id: string; label: string }> {
+  return svc.listProviders().map((p) => ({ id: p.id, label: p.label }))
+}
+
+function idleNow(): Promise<void> {
+  return Promise.resolve()
+}
+
+function seedRunnableAgent(sessionBySender: boolean): void {
+  mkdirSync(join(configDir, 'ws'), { recursive: true })
+  saveConfig({
+    skill_roots: [],
+    skill_groups: {},
+    prompts: {},
+    agents: [
+      {
+        id: 'a1',
+        name: '联运',
+        description: '',
+        workspace: join(configDir, 'ws'),
+        prompt: '',
+        prompt_placement: 'system',
+        skill_groups: [],
+        prompt_append_skills: true,
+        reuse_session: true,
+        session_by_sender: sessionBySender,
+        permission_mode: 'danger-full-access',
+        session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+        sessions: {},
+      },
+    ],
+    skill_apply: {},
+    pending_questionnaire_max_days: 7,
+    patrol_interval_minutes: 3,
+    use_hub_experts: true,
+  })
+}
+
+function askReq(traceId: string, sender: string): {
+  agentId: string
+  context: string
+  meta: { traceId: string; providerId: string; sessionParts: { bot_id: string; group_id: string }; sender: string }
+} {
+  return {
+    agentId: 'a1',
+    context: '用户[alice]: 你好',
+    meta: {
+      traceId,
+      providerId: 'demo',
+      sessionParts: { bot_id: 'r1', group_id: '1' },
+      sender,
+    },
+  }
+}
+
+let configDir: string
+let prevEnv: string | undefined
+
+beforeEach(() => {
+  prevEnv = process.env.AGENT_BOT_CONFIG_DIR
+  configDir = mkdtempSync(join(tmpdir(), 'agentbot-service-'))
+  process.env.AGENT_BOT_CONFIG_DIR = configDir
+  resetConfigCache()
+  resetInboundCache()
+  resetBindingsCache()
+})
+
+afterEach(() => {
+  resetConfigCache()
+  resetInboundCache()
+  resetBindingsCache()
+  if (prevEnv === undefined) delete process.env.AGENT_BOT_CONFIG_DIR
+  else process.env.AGENT_BOT_CONFIG_DIR = prevEnv
+  rmSync(configDir, { recursive: true, force: true })
+})
+
+describe('listAgents / getAgent', () => {
+  it('只返回通道摘要，不含 sessions', () => {
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: {},
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '说明',
+          workspace: '/tmp/ws',
+          prompt: '',
+          prompt_placement: 'system',
+          skill_groups: [],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: { demo_r1_1: { sessionId: 'sid', lastAskAt: 1 } },
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const svc = createAgentBotService(emptyHostServices())
+    expect(svc.listAgents()).toEqual([
+      { id: 'a1', name: '联运', description: '说明', workspace: '/tmp/ws' },
+    ])
+    expect(svc.getAgent('a1')).toEqual({
+      id: 'a1',
+      name: '联运',
+      description: '说明',
+      workspace: '/tmp/ws',
+    })
+    expect(svc.getAgent('missing')).toBeUndefined()
+  })
+})
+
+describe('registerProvider', () => {
+  it('空 id 抛错；listProviders 返回在线通道（含内置 local）', () => {
+    const svc = createAgentBotService(emptyHostServices())
+    expect(() => svc.registerProvider({ id: '', label: 'x' })).toThrow(/非空 id/)
+    const local = { id: 'local', label: '本地' }
+    expect(summary(svc)).toEqual([local])
+    const dispose = svc.registerProvider({ id: 'demo', label: '示例通道' })
+    expect(summary(svc)).toEqual([local, { id: 'demo', label: '示例通道' }])
+    dispose()
+    expect(summary(svc)).toEqual([local])
+  })
+
+  it('重复注册后写覆盖；旧 disposer 不删新代；内置 local 不受影响', () => {
+    const svc = createAgentBotService(emptyHostServices())
+    const local = { id: 'local', label: '本地' }
+    const oldDispose = svc.registerProvider({ id: 'demo', label: '旧' })
+    const newDispose = svc.registerProvider({ id: 'demo', label: '新' })
+    expect(summary(svc)).toEqual([local, { id: 'demo', label: '新' }])
+    oldDispose()
+    expect(summary(svc)).toEqual([local, { id: 'demo', label: '新' }])
+    newDispose()
+    expect(summary(svc)).toEqual([local])
+  })
+
+  it('label 空则回退为 id', () => {
+    const svc = createAgentBotService(emptyHostServices())
+    svc.registerProvider({ id: 'feishu', label: '' })
+    expect(summary(svc)).toEqual([{ id: 'local', label: '本地' }, { id: 'feishu', label: 'feishu' }])
+  })
+})
+
+describe('ask 校验先于回合', () => {
+  it('未注册 provider 先抛错，不走到回合', async () => {
+    const svc = createAgentBotService(emptyHostServices())
+    await expect(
+      svc.ask({
+        agentId: 'a1',
+        context: '用户[alice]: 你好',
+        meta: {
+          traceId: 't1',
+          providerId: 'demo',
+          sessionParts: { bot_id: 'r1', group_id: '1' },
+          sender: 'alice',
+        },
+      }),
+    ).rejects.toThrow(/未注册 provider demo/)
+  })
+
+  it('校验通过后同槽排队，idle 收口成单条 markdown', async () => {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: {},
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '',
+          workspace: join(configDir, 'ws'),
+          prompt: '',
+          prompt_placement: 'system',
+          skill_groups: [],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    const req = askReq('t1', 'alice')
+    const first = svc.ask(req)
+    const second = svc.ask(askReq('t2', 'alice'))
+    await expect(first).resolves.toEqual({ messages: [], pending: null })
+    await expect(second).resolves.toEqual({ messages: [], pending: null })
+  })
+
+  it('idle 时把本轮最后一条助手文本收成单条 markdown', async () => {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: {},
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '',
+          workspace: join(configDir, 'ws'),
+          prompt: '',
+          prompt_placement: 'system',
+          skill_groups: [],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const svc = createAgentBotService(
+      fakeHost(
+        [
+          { seq: 0, type: 'turn/start' },
+          { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '你好世界' }] } } },
+        ],
+        idleNow,
+      ),
+    )
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await expect(
+      svc.ask({
+        agentId: 'a1',
+        context: '用户[alice]: 你好',
+        meta: {
+          traceId: 't1',
+          providerId: 'demo',
+          sessionParts: { bot_id: 'r1', group_id: '1' },
+          sender: 'alice',
+        },
+      }),
+    ).resolves.toEqual({
+      messages: [{ kind: 'markdown', text: '你好世界', url: '', atUserIds: [], atAll: false }],
+      pending: null,
+    })
+    const slot = getAgent('a1')?.sessions.demo_r1_1
+    expect(slot?.sessionId).toEqual(expect.any(String))
+    expect(slot?.sessionId.length).toBeGreaterThan(0)
+    expect(slot?.lastAskAt).toBeGreaterThan(1_700_000_000_000)
+  })
+
+  it('同槽第二轮读到上一轮 lastAskAt 后复用 sessionId', async () => {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: {},
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '',
+          workspace: join(configDir, 'ws'),
+          prompt: '',
+          prompt_placement: 'system',
+          skill_groups: [],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    const req = askReq('t1', 'alice')
+    await svc.ask(req)
+    const first = getAgent('a1')?.sessions.demo_r1_1
+    if (first === undefined) throw new Error('test: 第一轮应收口写槽')
+    await svc.ask({ ...req, meta: { ...req.meta, traceId: 't2' } })
+    const second = getAgent('a1')?.sessions.demo_r1_1
+    expect(second?.sessionId).toBe(first.sessionId)
+    expect(second?.lastAskAt).toBeGreaterThanOrEqual(first.lastAskAt)
+    expect(second?.promptFingerprint).toBe('')
+  })
+
+  it('改 prompt 后同槽下次 ask 开新会话', async () => {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: { default: { system_prompt: '旧文', tools: [] } },
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '',
+          workspace: join(configDir, 'ws'),
+          prompt: 'default',
+          prompt_placement: 'system',
+          skill_groups: [],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    const req = askReq('t1', 'alice')
+    await svc.ask(req)
+    const first = getAgent('a1')?.sessions.demo_r1_1
+    if (first === undefined) throw new Error('test: 第一轮应收口写槽')
+    expect(first.promptFingerprint).toBe('旧文')
+    const cfg = getAgent('a1')
+    if (cfg === undefined) throw new Error('test: agent 应存在')
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: { default: { system_prompt: '新文', tools: [] } },
+      agents: [cfg],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    await svc.ask({ ...req, meta: { ...req.meta, traceId: 't2' } })
+    const second = getAgent('a1')?.sessions.demo_r1_1
+    expect(second?.sessionId).not.toBe(first.sessionId)
+    expect(second?.promptFingerprint).toBe('新文')
+  })
+
+  it('prompt_placement=user 不写系统提示词，接到用户对话后', async () => {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: { default: { system_prompt: '你是{{sender}}助手', tools: [] } },
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '',
+          workspace: join(configDir, 'ws'),
+          prompt: 'default',
+          prompt_placement: 'user',
+          skill_groups: [],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const followups: unknown[] = []
+    const svc = createAgentBotService(fakeHost([], idleNow, { followups }))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await svc.ask(askReq('t1', 'alice'))
+    const payload = followups[0] as { content: Array<{ text: string }> }
+    expect(payload.content[0]?.text).toBe('用户[alice]: 你好\n\n你是alice助手\n\n——本群任务板（specs/12）——\n（本群暂无 running 任务；你可以 open_task 新建一份，或直接自己做）')
+    expect(getAgent('a1')?.sessions.demo_r1_1?.promptFingerprint).toBe('user\n你是{{sender}}助手')
+  })
+
+  it('ask 按 agent skill_groups 追加推荐工具', async () => {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: { rd: { id: 'rd', name: 'rd', skill_ids: ['hub/union-xxx', 'git-skill'] } },
+      prompts: { default: { system_prompt: '角色说明', tools: ['bash'] } },
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '',
+          workspace: join(configDir, 'ws'),
+          prompt: 'default',
+          prompt_placement: 'user',
+          skill_groups: ['rd'],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const followups: unknown[] = []
+    const svc = createAgentBotService(fakeHost([], idleNow, { followups }))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await svc.ask(askReq('t1', 'alice'))
+    const payload = followups[0] as { content: Array<{ text: string }> }
+    expect(payload.content[0]?.text).toBe('用户[alice]: 你好\n\n角色说明\n\n推荐工具：union-xxx, git-skill\n\n——本群任务板（specs/12）——\n（本群暂无 running 任务；你可以 open_task 新建一份，或直接自己做）')
+    expect(getAgent('a1')?.sessions.demo_r1_1?.promptFingerprint).toBe('user\n角色说明\n\n推荐工具：union-xxx, git-skill')
+  })
+
+  it('prompt_append_skills=false 不把技能名写进 prompt', async () => {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: { rd: { id: 'rd', name: 'rd', skill_ids: ['hub/union-xxx'] } },
+      prompts: { default: { system_prompt: '角色说明', tools: ['bash'] } },
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '',
+          workspace: join(configDir, 'ws'),
+          prompt: 'default',
+          prompt_placement: 'user',
+          skill_groups: ['rd'],
+          prompt_append_skills: false,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const followups: unknown[] = []
+    const svc = createAgentBotService(fakeHost([], idleNow, { followups }))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await svc.ask(askReq('t1', 'alice'))
+    const payload = followups[0] as { content: Array<{ text: string }> }
+    expect(payload.content[0]?.text).toBe('用户[alice]: 你好\n\n角色说明\n\n——本群任务板（specs/12）——\n（本群暂无 running 任务；你可以 open_task 新建一份，或直接自己做）')
+    expect(getAgent('a1')?.sessions.demo_r1_1?.promptFingerprint).toBe('user\n角色说明')
+  })
+
+  it('校验通过后无 agents 服务显式抛错', async () => {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: {},
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '',
+          workspace: join(configDir, 'ws'),
+          prompt: '',
+          prompt_placement: 'system',
+          skill_groups: [],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const svc = createAgentBotService(emptyHostServices())
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await expect(
+      svc.ask({
+        agentId: 'a1',
+        context: '用户[alice]: 你好',
+        meta: {
+          traceId: 't1',
+          providerId: 'demo',
+          sessionParts: { bot_id: 'r1', group_id: '1' },
+          sender: 'alice',
+        },
+      }),
+    ).rejects.toThrow(/agents 服务不可用/)
+  })
+
+  it('unload dispose 释放本轮 create 的 handle', async () => {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: {},
+      agents: [
+        {
+          id: 'a1',
+          name: '联运',
+          description: '',
+          workspace: join(configDir, 'ws'),
+          prompt: '',
+          prompt_placement: 'system',
+          skill_groups: [],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: "serial",
+          needs_target_workspace: false,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    let disposed = 0
+    const host = fakeHost([], idleNow)
+    const origCreate = host.agents()?.create
+    if (origCreate === undefined) throw new Error('test: fakeHost 缺 create')
+    const agents = host.agents()
+    if (agents === undefined) throw new Error('test: fakeHost 缺 agents')
+    agents.create = async (options) => {
+      const handle = await origCreate(options)
+      return {
+        agent: handle.agent,
+        async dispose() {
+          disposed += 1
+          await handle.dispose()
+        },
+      }
+    }
+    const svc = createAgentBotService(host)
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await svc.ask({
+      agentId: 'a1',
+      context: '用户[alice]: 你好',
+      meta: {
+        traceId: 't1',
+        providerId: 'demo',
+        sessionParts: { bot_id: 'r1', group_id: '1' },
+        sender: 'alice',
+      },
+    })
+    expect(disposed).toBe(0)
+    await svc.dispose()
+    expect(disposed).toBe(1)
+    await svc.dispose()
+    expect(disposed).toBe(1)
+  })
+
+  it('未知 agent 显式抛错', async () => {
+    const svc = createAgentBotService(emptyHostServices())
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await expect(svc.ask(askReq('t1', 'alice'))).rejects.toThrow(/未知 agent a1/)
+  })
+
+  it('session_by_sender 按人编 key 并写槽', async () => {
+    seedRunnableAgent(true)
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await svc.ask(askReq('t1', 'alice'))
+    expect(getAgent('a1')?.sessions.demo_r1_1_alice?.sessionId).toEqual(expect.any(String))
+    expect(getAgent('a1')?.sessions.demo_r1_1).toBeUndefined()
+    await expect(svc.ask(askReq('t2', ''))).rejects.toThrow(/session_by_sender 需要非空 sender/)
+  })
+
+  it('空回复：idle 且无助手文本 → messages=[] pending=null', async () => {
+    seedRunnableAgent(false)
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await expect(svc.ask(askReq('t1', 'alice'))).resolves.toEqual({ messages: [], pending: null })
+  })
+
+  it('没有 deliver 时等到 idle，不设安全阀', async () => {
+    seedRunnableAgent(false)
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await expect(svc.ask(askReq('t1', 'alice'))).resolves.toEqual({ messages: [], pending: null })
+  })
+})
+
+describe('出站按通道能力分档（specs/12 §入站出站）', () => {
+  it('通道有 deliver → 立刻回执；这一轮产出异步推回', async () => {
+    seedRunnableAgent(false)
+    const events = [
+      { seq: 1, type: 'turn/start' },
+      { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '答案在此' }] } } },
+    ]
+    const delivered: Array<{ providerId: string; text: string[] }> = []
+    const svc = createAgentBotService(fakeHost(events, idleNow))
+    svc.registerProvider({
+      id: 'demo',
+      label: '示例通道',
+      deliver: async (req) => { delivered.push({ providerId: 'demo', text: req.messages.map((m) => m.text) }) },
+    })
+    const r = await svc.ask(askReq('t1', 'alice'))
+    expect(r.messages.map((m) => m.text).join('')).toContain('已接')  // 立刻回执，不等回合
+    expect(r.pending).toBeNull()
+    await new Promise((res) => setTimeout(res, 30))                   // 等后台推回
+    expect(delivered[0]?.text[0]).toContain('答案在此')
+  })
+
+  it('异步模式（有 deliver）：人回话后同样自动清待决（回合结束后在后台做）', async () => {
+    seedRunnableAgent(false)
+    const { createTask, readTask, writeTask } = await import('../model/teamwork/task-board.js')
+    const t = createTask({
+      taskLead: 'a1', sender: 'alice', providerId: 'demo',
+      sessionParts: { bot_id: 'r1', group_id: '1' }, originContext: 'c',
+      access: 'write', groupSnapshot: [],
+    })
+    const w = readTask('running', t.taskId)!
+    w.pendingHuman = { questions: ['要哪个尺寸？'], askedBy: 'a1', askedAt: 7, toHuman: true }
+    writeTask('running', w)
+
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道', deliver: async () => undefined })
+    const r = await svc.ask(askReq('t1', 'alice'))
+    expect(r.messages.map((m) => m.text).join('')).toContain('已接') // 立刻回执
+    await new Promise((res) => setTimeout(res, 30))                  // 等后台收尾
+    expect(readTask('running', t.taskId)?.pendingHuman).toBeUndefined()
+  })
+
+  it('通道没有 deliver → 保持同步：直接回这一轮的文本（退化路径）', async () => {
+    seedRunnableAgent(false)
+    const events = [
+      { seq: 1, type: 'turn/start' },
+      { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '同步答案' }] } } },
+    ]
+    const svc = createAgentBotService(fakeHost(events, idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    const r = await svc.ask(askReq('t1', 'alice'))
+    expect(r.messages.map((m) => m.text).join('')).toContain('同步答案')
+    expect(r.messages.map((m) => m.text).join('')).not.toContain('已接')
+  })
+})
+
+describe('入站登记入站上下文（specs/12 §入站怎么绑任务）', () => {
+  /** 两个 agent：a1（被 @ 的）+ a2（可派的专家）。 */
+  function seedTwoAgents(useHubExperts: boolean): void {
+    mkdirSync(join(configDir, 'ws'), { recursive: true })
+    const base = {
+      description: '',
+      workspace: join(configDir, 'ws'),
+      prompt: '',
+      prompt_placement: 'system' as const,
+      skill_groups: [] as string[],
+      prompt_append_skills: true,
+      reuse_session: true,
+      session_by_sender: false,
+      permission_mode: 'danger-full-access' as const,
+      session_timeout_minutes: 30,
+      concurrency: 'serial' as const,
+      needs_target_workspace: false,
+      sessions: {},
+    }
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: {},
+      agents: [
+        { ...base, id: 'a1', name: '联运' },
+        { ...base, id: 'a2', name: '设计师' },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: useHubExperts,
+    })
+  }
+
+  it('ask 后登记 sender / providerId / sessionParts / originContext', async () => {
+    seedTwoAgents(true)
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await svc.ask(askReq('t1', 'alice'))
+    const sid = getAgent('a1')?.sessions.demo_r1_1?.sessionId ?? ''
+    const ctx = inboundFor(sid)
+    expect(ctx?.sender).toBe('alice')
+    expect(ctx?.providerId).toBe('demo')
+    expect(ctx?.sessionParts).toEqual({ bot_id: 'r1', group_id: '1' })
+    expect(ctx?.originContext).toBe('用户[alice]: 你好')
+  })
+
+  it('开关默认开：快照 = agents.json 全集，且去掉自己', async () => {
+    seedTwoAgents(true)
+    let asked = false
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({
+      id: 'demo',
+      label: '示例通道',
+      listGroupAgents: () => {
+        asked = true
+        return [{ agentId: 'a2', name: '设计师', description: '' }]
+      },
+    })
+    await svc.ask(askReq('t1', 'alice'))
+    const sid = getAgent('a1')?.sessions.demo_r1_1?.sessionId ?? ''
+    const snap = inboundFor(sid)?.groupSnapshot ?? []
+    expect(snap.map((m) => m.agentId)).toEqual(['a2'])
+    expect(asked).toBe(false) // hub 模式不问通道
+  })
+
+  it('人 @lead 说完这一轮 → 旧问卷待决自动清掉', async () => {
+    seedRunnableAgent(false)
+    const { createTask, readTask, writeTask } = await import('../model/teamwork/task-board.js')
+    const t = createTask({
+      taskLead: 'a1', sender: 'alice', providerId: 'demo',
+      sessionParts: { bot_id: 'r1', group_id: '1' }, originContext: 'c',
+      access: 'write', groupSnapshot: [],
+    })
+    const w = readTask('running', t.taskId)!
+    w.pendingHuman = { questions: ['要哪个尺寸？'], askedBy: 'a1', askedAt: 42, toHuman: true }
+    writeTask('running', w)
+
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await svc.ask(askReq('t1', 'alice')) // 人回话（软路由进该单任务槽 → 已绑定）
+    expect(readTask('running', t.taskId)?.pendingHuman).toBeUndefined()
+  })
+
+  it('local 的 deliver：回给发起那一单的 DSH 会话（活着就推进去）', async () => {
+    seedRunnableAgent(false)
+    const pushed: string[] = []
+    // 假 host：把发起会话 id 当成一条活会话
+    const host = {
+      ...emptyHostServices(),
+      agents: () => ({
+        get: (id: string) =>
+          id === 'dsh-1' ? ({ followup: (m: unknown) => pushed.push(JSON.stringify(m)) } as unknown as AgentLike) : undefined,
+      }),
+    } as HostServices
+    const svc = createAgentBotService(host)
+    const deliver = svc.providerDeliver('local')
+    expect(deliver).toBeDefined()
+    await deliver!({
+      sessionParts: { provider_id: 'local', session: 'dsh-1' },
+      messages: [{ kind: 'markdown', text: '需要你确认：尺寸？', url: '', atUserIds: [], atAll: false }],
+    })
+    expect(pushed.join('')).toContain('需要你确认')
+    // 推进会话了就不落收件箱（不重复）
+    expect(svc.drainLocalInbox('dsh-1')).toEqual([])
+  })
+
+  it('local 的 deliver：会话不在线 → 落收件箱兜底，可被取走', async () => {
+    seedRunnableAgent(false)
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    const deliver = svc.providerDeliver('local')!
+    await deliver({ sessionParts: { provider_id: 'local', session: 'gone' }, messages: [{ kind: 'markdown', text: '还在做：B', url: '', atUserIds: [], atAll: false }] })
+    expect(svc.drainLocalInbox('gone').map((m) => m.text)).toEqual(['还在做：B'])
+    expect(svc.drainLocalInbox('gone')).toEqual([]) // 取走即清空
+  })
+
+  it('开关关闭：问 listGroupAgents，过滤幽灵成员与自己', async () => {
+    seedTwoAgents(false)
+    let asked = 0
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({
+      id: 'demo',
+      label: '示例通道',
+      listGroupAgents: () => {
+        asked += 1
+        return [
+          { agentId: 'a2', name: '设计师', description: '' },
+          { agentId: 'a1', name: '自己', description: '' },   // 自己 → 去掉
+          { agentId: 'ghost', name: '幽灵', description: '' }, // 不在 agents.json → 丢掉
+        ]
+      },
+    })
+    await svc.ask(askReq('t1', 'alice'))
+    const sid = getAgent('a1')?.sessions.demo_r1_1?.sessionId ?? ''
+    const snap = inboundFor(sid)?.groupSnapshot ?? []
+    expect(asked).toBe(1)
+    expect(snap.map((m) => m.agentId)).toEqual(['a2'])
+  })
+})
+
+describe('直连 needs_target_workspace：会话开在专家工作区，做完抛回调用方', () => {
+  it('cwd 是专家 workspace，产出目录只注入；自己做完 followup 回 session_a', async () => {
+    const designerWs = join(configDir, 'designer')
+    const project = join(configDir, 'workspace_a')
+    mkdirSync(designerWs, { recursive: true })
+    mkdirSync(project, { recursive: true })
+    saveConfig({
+      skill_roots: [],
+      skill_groups: {},
+      prompts: {},
+      agents: [
+        {
+          id: 'designer',
+          name: '设计师',
+          description: '',
+          workspace: designerWs,
+          prompt: '',
+          prompt_placement: 'system',
+          skill_groups: [],
+          prompt_append_skills: true,
+          reuse_session: true,
+          session_by_sender: false,
+          permission_mode: 'danger-full-access',
+          session_timeout_minutes: 30,
+          concurrency: 'serial',
+          needs_target_workspace: true,
+          sessions: {},
+        },
+      ],
+      skill_apply: {},
+      pending_questionnaire_max_days: 7,
+      patrol_interval_minutes: 3,
+      use_hub_experts: true,
+    })
+    const events = [
+      { seq: 1, type: 'turn/start' },
+      { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '首页稿在 workspace_a' }] } } },
+    ]
+    const created: string[] = []
+    const attached: string[] = []
+    const pushed: string[] = []
+    const live = new Map<string, AgentLike>()
+    live.set('session-a', {
+      session: { seq: 0, snapshotEvents: () => [], append() { return } },
+      followup(input) { pushed.push(JSON.stringify(input)) },
+      whenIdle: idleNow,
+    })
+    const agents: AgentsService = {
+      get(id) { return live.get(id) },
+      async create(options) {
+        const meta = options.meta as { cwd?: string } | undefined
+        created.push(meta?.cwd ?? '')
+        const agent: AgentLike = {
+          session: { seq: 0, snapshotEvents: () => events, append() { return } },
+          followup() { return },
+          whenIdle: idleNow,
+        }
+        live.set(String(options.sessionId), agent)
+        return { agent, async dispose() { return } }
+      },
+      async resume() { throw new Error('test: unexpected resume') },
+    }
+    const host = {
+      ...emptyHostServices(),
+      agents: () => agents,
+      agentDefaultModel: () => ({ currentSelection: () => ({ provider: 'p', model: 'm' }) }),
+      agentPresets: () => ({ async mount() { return } }),
+      sessionPersistence: () => ({ async list() { return [] } }),
+      workspaceRegistry: () => ({
+        archivedSessionIds: [],
+        async create(path: string, title?: string) {
+          return {
+            title,
+            async attachSession() { attached.push(path) },
+            async setTitle() { return },
+          }
+        },
+      }),
+    } as HostServices
+    const svc = createAgentBotService(host)
+    const r = await svc.localAsk('设计师 设计首页', 'session-a', project)
+    expect(r.error).toBeUndefined()
+    expect(r.messages.map((m) => m.text).join('')).toContain('已接')
+    expect(created).toEqual([designerWs])
+    expect(attached).toEqual([designerWs])
+    const slotKey = Object.keys(getAgent('designer')?.sessions ?? {}).find((k) => k.includes('session-a'))
+    expect(slotKey).toMatch(/__ag_[0-9a-f]{12}$/)
+    const expertSessionId = getAgent('designer')?.sessions[slotKey ?? '']?.sessionId ?? ''
+    await new Promise((res) => setTimeout(res, 30))
+    expect(pushed.join('')).toContain('首页稿在 workspace_a')
+    expect(pushed.join('')).toContain('不要再次调用 agent_ask')
+    const { listTasksIn } = await import('../model/teamwork/task-board.js')
+    const { boundTaskId } = await import('../model/teamwork/binding.js')
+    expect(listTasksIn('running')).toHaveLength(0)
+    const done = listTasksIn('done')
+    expect(done).toHaveLength(1)
+    expect(done[0]?.sessionParts.session).toBe('session-a')
+    expect(done[0]?.leadSessionId).toBe(expertSessionId)
+    expect(boundTaskId(expertSessionId)).toBeUndefined()
+  })
+
+  it('同一会话自己做完不建 job', async () => {
+    seedRunnableAgent(false)
+    const svc = createAgentBotService(fakeHost([], idleNow))
+    svc.registerProvider({ id: 'demo', label: '示例通道' })
+    await svc.ask(askReq('t-same', 'alice'))
+    const { listTasksIn } = await import('../model/teamwork/task-board.js')
+    expect(listTasksIn('running')).toHaveLength(0)
+    expect(listTasksIn('done')).toHaveLength(0)
+  })
+})

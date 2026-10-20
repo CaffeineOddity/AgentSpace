@@ -4,3 +4,6 @@ node_modules/
 design/output-selftest/node_modules/*
 # 自测产物与运行时目录，不进版本控制
 design/
+.dist
+**/*/dist
+.DS_Store
