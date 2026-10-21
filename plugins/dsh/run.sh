@@ -81,6 +81,34 @@ pm_pack() {
   ( cd "$1" && "$PM" pack --pack-destination "$2" )
 }
 
+# 仓库根没有 package.json，不能在根目录 install。
+# 编译前补齐插件依赖；Vite 把 react 指到 ui/node_modules，缺了也要装。
+ensure_node_modules() {
+  local dir="$1" label="$2" marker="$3"
+  if [[ ! -f "$dir/package.json" ]]; then
+    return 0
+  fi
+  if [[ -e "$dir/$marker" ]]; then
+    return 0
+  fi
+  log "安装 ${label} 依赖（缺少 ${marker}）..."
+  ( cd "$dir" && "$PM" install )
+}
+
+ensure_build_deps() {
+  local has_script=false
+  if node -e "const s=require('$PLUGIN_DIR/package.json').scripts||{}; process.exit(s.typecheck||s.build?0:1)" 2>/dev/null; then
+    has_script=true
+  fi
+  if [[ "$has_script" != true ]]; then
+    return 0
+  fi
+  if [[ -f "$PLUGIN_DIR/web/vite.config.ts" || -f "$PLUGIN_DIR/web/vite.config.js" || -f "$PLUGIN_DIR/web/vite.config.mjs" ]]; then
+    ensure_node_modules "$SCRIPT_DIR/ui" "ui/" "node_modules/react"
+  fi
+  ensure_node_modules "$PLUGIN_DIR" "$PLUGIN" "node_modules"
+}
+
 # 1) 加载 nvm（如果装了）-- nvm 是 node 版本管理器，加载后 node/corepack 自动进 PATH
 # nvm.sh 内部命令可能返回非零，set -e 会中断脚本，source 时临时关掉
 if [[ -z "${NVM_BIN:-}" ]] && [[ -s "$HOME/.nvm/nvm.sh" ]]; then
@@ -256,6 +284,9 @@ do_release() {
     set_pkg_version "$new_version"
     log "package.json 版本号已更新为 $new_version"
   fi
+
+  # 缺 node_modules 时先安装。根目录 pnpm install 会因没有 package.json 失败。
+  ensure_build_deps
 
   # typecheck（有 typecheck 脚本才跑）
   if node -e "process.exit(require('$PLUGIN_DIR/package.json').scripts?.typecheck ? 0 : 1)" 2>/dev/null; then
